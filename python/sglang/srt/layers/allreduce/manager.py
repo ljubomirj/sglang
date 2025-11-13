@@ -84,7 +84,7 @@ class AdaptiveAllReduceManager:
         )
 
         self.custom_allreduce = CustomAllreduce(
-            group=get_tp_group().device_group,
+            group=get_tp_group().cpu_group,
             device=device,
         )
         if not self.custom_allreduce.disabled:
