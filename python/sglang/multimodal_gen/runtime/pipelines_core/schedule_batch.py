@@ -311,3 +311,5 @@ class OutputBatch:
 
     saved_file_paths: list[str] | None = None
     server_postprocess_timings: dict[str, float] | None = None
+
+    scheduler_timings: dict[str, float] | None = None

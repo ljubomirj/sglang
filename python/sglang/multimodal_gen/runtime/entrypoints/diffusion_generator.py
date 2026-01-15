@@ -316,6 +316,18 @@ class DiffGenerator:
                                 server_can_stay_s,
                             )
 
+                            sched_t = getattr(output_batch, "scheduler_timings", None)
+                            if isinstance(sched_t, dict):
+                                logger.info(
+                                    "[TimingBreakdown][SchedulerDetail] queue_wait=%.4fs, recv_multipart=%.4fs, recv_pickle_loads=%.4fs, bcast_sp=%.4fs, bcast_cfg=%.4fs, bcast_tp=%.4fs",
+                                    float(sched_t.get("queue_wait_s", 0.0)),
+                                    float(sched_t.get("recv_multipart_s", 0.0)),
+                                    float(sched_t.get("recv_pickle_loads_s", 0.0)),
+                                    float(sched_t.get("broadcast_sp_s", 0.0)),
+                                    float(sched_t.get("broadcast_cfg_s", 0.0)),
+                                    float(sched_t.get("broadcast_tp_s", 0.0)),
+                                )
+
                             for output_idx, save_path in enumerate(server_saved_paths):
                                 result_item: dict[str, Any] = {
                                     "saved_file_path": save_path,
@@ -433,6 +445,18 @@ class DiffGenerator:
                             server_peak_query_s,
                             server_can_stay_s,
                         )
+
+                        sched_t = getattr(output_batch, "scheduler_timings", None)
+                        if isinstance(sched_t, dict):
+                            logger.info(
+                                "[TimingBreakdown][SchedulerDetail] queue_wait=%.4fs, recv_multipart=%.4fs, recv_pickle_loads=%.4fs, bcast_sp=%.4fs, bcast_cfg=%.4fs, bcast_tp=%.4fs",
+                                float(sched_t.get("queue_wait_s", 0.0)),
+                                float(sched_t.get("recv_multipart_s", 0.0)),
+                                float(sched_t.get("recv_pickle_loads_s", 0.0)),
+                                float(sched_t.get("broadcast_sp_s", 0.0)),
+                                float(sched_t.get("broadcast_cfg_s", 0.0)),
+                                float(sched_t.get("broadcast_tp_s", 0.0)),
+                            )
                         results.append(result_item)
             except Exception:
                 continue

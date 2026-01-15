@@ -4,6 +4,7 @@
 import asyncio
 import os
 import pickle
+import time
 from collections import deque
 from copy import deepcopy
 from typing import Any, List
@@ -90,7 +91,7 @@ class Scheduler:
         }
 
         # FIFO, new reqs are appended
-        self.waiting_queue: deque[tuple[bytes, Req]] = deque()
+        self.waiting_queue: deque[tuple[bytes, Req, float]] = deque()
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
@@ -145,7 +146,18 @@ class Scheduler:
         replies to client, only on rank 0
         """
         if not is_warmup and self.receiver is not None and identity is not None:
-            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+            t_dump_start = time.perf_counter()
+            payload = pickle.dumps(output_batch)
+            t_dump_end = time.perf_counter()
+            t_send_start = time.perf_counter()
+            self.receiver.send_multipart([identity, b"", payload])
+            t_send_end = time.perf_counter()
+
+            logger.info(
+                "[SchedulerTiming] reply_pickle_dumps=%.6fs, reply_send_multipart=%.6fs",
+                t_dump_end - t_dump_start,
+                t_send_end - t_send_start,
+            )
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
         """pull a req from waiting_queue"""
@@ -153,9 +165,14 @@ class Scheduler:
             return None
 
         # pop the first (earliest)
-        item = self.waiting_queue.popleft()
+        identity, req, enqueue_time = self.waiting_queue.popleft()
+        queue_wait_s = time.perf_counter() - enqueue_time
+        try:
+            setattr(req, "_scheduler_queue_wait_s", queue_wait_s)
+        except Exception:
+            pass
 
-        return [item]
+        return [(identity, req)]
 
     def prepare_server_warmup_reqs(self):
         if (
@@ -202,7 +219,7 @@ class Scheduler:
                         prompt="",
                         is_warmup=True,
                     )
-                self.waiting_queue.append((None, req))
+                self.waiting_queue.append((None, req, time.perf_counter()))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
 
@@ -236,10 +253,19 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
+                    t_recv_start = time.perf_counter()
                     identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    t_recv_end = time.perf_counter()
+                    t_load_start = time.perf_counter()
                     recv_reqs = pickle.loads(payload)
+                    t_load_end = time.perf_counter()
+                    recv_timings = {
+                        "recv_multipart_s": t_recv_end - t_recv_start,
+                        "recv_pickle_loads_s": t_load_end - t_load_start,
+                    }
                 except zmq.Again:
                     recv_reqs = []
+                    recv_timings = None
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
@@ -253,31 +279,51 @@ class Scheduler:
                 recv_reqs = [(identity, req) for req in recv_reqs]
         else:
             recv_reqs = None
+            recv_timings = None
 
         # TODO: fix this condition
         if self.server_args.sp_degree != 1:
+            t_bcast_start = time.perf_counter()
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.worker.sp_group.rank,
                 self.worker.sp_cpu_group,
                 src=self.worker.sp_group.ranks[0],
             )
+            t_bcast_end = time.perf_counter()
+            if recv_timings is not None:
+                recv_timings["broadcast_sp_s"] = t_bcast_end - t_bcast_start
 
         if self.server_args.enable_cfg_parallel:
+            t_bcast_start = time.perf_counter()
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.worker.cfg_group.rank,
                 self.worker.cfg_cpu_group,
                 src=self.worker.cfg_group.ranks[0],
             )
+            t_bcast_end = time.perf_counter()
+            if recv_timings is not None:
+                recv_timings["broadcast_cfg_s"] = t_bcast_end - t_bcast_start
 
         if self.server_args.tp_size > 1:
+            t_bcast_start = time.perf_counter()
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.worker.tp_group.rank,
                 self.worker.tp_cpu_group,
                 src=self.worker.tp_group.ranks[0],
             )
+            t_bcast_end = time.perf_counter()
+            if recv_timings is not None:
+                recv_timings["broadcast_tp_s"] = t_bcast_end - t_bcast_start
+
+        if recv_timings is not None and recv_reqs:
+            for _identity, _req in recv_reqs:
+                try:
+                    setattr(_req, "_scheduler_recv_timings", recv_timings)
+                except Exception:
+                    pass
 
         assert recv_reqs is not None
 
@@ -298,7 +344,8 @@ class Scheduler:
             try:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
-                self.waiting_queue.extend(new_reqs)
+                now = time.perf_counter()
+                self.waiting_queue.extend([(i, r, now) for (i, r) in new_reqs])
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
@@ -336,6 +383,18 @@ class Scheduler:
                     output_batch = OutputBatch(
                         error=f"Unknown request type: {type(processed_req)}"
                     )
+
+                timings = getattr(output_batch, "scheduler_timings", None)
+                if timings is None or not isinstance(timings, dict):
+                    timings = {}
+                timings["queue_wait_s"] = float(
+                    getattr(processed_req, "_scheduler_queue_wait_s", 0.0)
+                )
+
+                recv_t = getattr(processed_req, "_scheduler_recv_timings", None)
+                if isinstance(recv_t, dict):
+                    timings.update(recv_t)
+                output_batch.scheduler_timings = timings
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
