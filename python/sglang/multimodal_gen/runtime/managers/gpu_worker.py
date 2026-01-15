@@ -139,21 +139,44 @@ class GPUWorker:
                 output_batch = result
 
             if self.rank == 0:
+                t_mem_start = time.perf_counter()
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
+                t_peak_end = time.perf_counter()
+
                 output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
                 peak_memory_gb = peak_memory_bytes / (1024**3)
                 remaining_gpu_mem_gb = (
                     current_platform.get_device_total_memory() / (1024**3)
                     - peak_memory_gb
                 )
+                t_remaining_end = time.perf_counter()
+
                 can_stay_resident = self.get_can_stay_resident_components(
                     remaining_gpu_mem_gb
                 )
+                t_can_stay_end = time.perf_counter()
+
                 logger.info(
                     f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
                     f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
                     f"Components that can stay resident: {can_stay_resident}"
                 )
+                t_log_end = time.perf_counter()
+
+                try:
+                    setattr(
+                        output_batch,
+                        "server_memory_timings",
+                        {
+                            "peak_query_s": t_peak_end - t_mem_start,
+                            "remaining_calc_s": t_remaining_end - t_peak_end,
+                            "can_stay_resident_s": t_can_stay_end - t_remaining_end,
+                            "mem_log_s": t_log_end - t_can_stay_end,
+                            "mem_total_s": t_log_end - t_mem_start,
+                        },
+                    )
+                except Exception:
+                    pass
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms

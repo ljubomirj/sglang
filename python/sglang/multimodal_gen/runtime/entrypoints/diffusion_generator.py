@@ -270,15 +270,52 @@ class DiffGenerator:
                             "trajectory_decoded": output_batch.trajectory_decoded,
                             "prompt_index": output_idx,
                         }
-                        if getattr(req, "debug", False):
-                            logger.info(
-                                "[TimingBreakdown] scheduler_roundtrip=%.4fs, postprocess_total=%.4fs (convert=%.4fs, to_numpy=%.4fs, save=%.4fs)",
-                                scheduler_roundtrip_s,
-                                post_timings.get("postprocess_total_s", 0.0),
-                                post_timings.get("postprocess_convert_s", 0.0),
-                                post_timings.get("postprocess_to_numpy_s", 0.0),
-                                post_timings.get("postprocess_save_s", 0.0),
+                        logger.info(
+                            "[TimingBreakdown] scheduler_roundtrip=%.4fs, postprocess_total=%.4fs (convert=%.4fs, to_numpy=%.4fs, save=%.4fs)",
+                            scheduler_roundtrip_s,
+                            post_timings.get("postprocess_total_s", 0.0),
+                            post_timings.get("postprocess_convert_s", 0.0),
+                            post_timings.get("postprocess_to_numpy_s", 0.0),
+                            post_timings.get("postprocess_save_s", 0.0),
+                        )
+
+                        server_total_s = 0.0
+                        if output_batch.timings is not None:
+                            server_total_s = (
+                                output_batch.timings.total_duration_ms / 1000.0
                             )
+                        scheduler_overhead_s = max(
+                            0.0, scheduler_roundtrip_s - server_total_s
+                        )
+
+                        transport = getattr(output_batch, "client_transport_timings", None)
+                        if isinstance(transport, dict):
+                            client_send_s = float(transport.get("send_pyobj_s", 0.0))
+                            client_recv_s = float(transport.get("recv_pyobj_s", 0.0))
+                        else:
+                            client_send_s = 0.0
+                            client_recv_s = 0.0
+
+                        mem_t = getattr(output_batch, "server_memory_timings", None)
+                        if isinstance(mem_t, dict):
+                            server_mem_total_s = float(mem_t.get("mem_total_s", 0.0))
+                            server_peak_query_s = float(mem_t.get("peak_query_s", 0.0))
+                            server_can_stay_s = float(mem_t.get("can_stay_resident_s", 0.0))
+                        else:
+                            server_mem_total_s = 0.0
+                            server_peak_query_s = 0.0
+                            server_can_stay_s = 0.0
+
+                        logger.info(
+                            "[TimingBreakdown][Scheduler] server_total=%.4fs, roundtrip_overhead=%.4fs, client_send=%.4fs, client_recv=%.4fs, server_mem_total=%.4fs (peak_query=%.4fs, can_stay=%.4fs)",
+                            server_total_s,
+                            scheduler_overhead_s,
+                            client_send_s,
+                            client_recv_s,
+                            server_mem_total_s,
+                            server_peak_query_s,
+                            server_can_stay_s,
+                        )
                         results.append(result_item)
             except Exception:
                 continue

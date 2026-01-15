@@ -1,4 +1,5 @@
 import pickle
+import time
 from typing import Any
 
 import zmq
@@ -79,8 +80,25 @@ class SchedulerClient:
     def forward(self, batch: Any) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
         try:
+            t_send_start = time.perf_counter()
             self.scheduler_socket.send_pyobj(batch)
+            t_send_end = time.perf_counter()
+
+            t_recv_start = time.perf_counter()
             output_batch = self.scheduler_socket.recv_pyobj()
+            t_recv_end = time.perf_counter()
+
+            try:
+                setattr(
+                    output_batch,
+                    "client_transport_timings",
+                    {
+                        "send_pyobj_s": t_send_end - t_send_start,
+                        "recv_pyobj_s": t_recv_end - t_recv_start,
+                    },
+                )
+            except Exception:
+                pass
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
