@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init
 
 logger = init_logger(__name__)
 
+
+_SCHEDULER_RECV_TIMEOUT_MS = 10
+
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
@@ -65,6 +68,7 @@ class Scheduler:
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
+            self.receiver.setsockopt(zmq.RCVTIMEO, _SCHEDULER_RECV_TIMEOUT_MS)
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
             self.receiver = None
@@ -254,7 +258,7 @@ class Scheduler:
             try:
                 try:
                     t_recv_start = time.perf_counter()
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, _, payload = self.receiver.recv_multipart()
                     t_recv_end = time.perf_counter()
                     t_load_start = time.perf_counter()
                     recv_reqs = pickle.loads(payload)
@@ -340,31 +344,32 @@ class Scheduler:
         )
 
         while self._running:
-            # 1: receive requests
-            try:
-                new_reqs = self.recv_reqs()
-                new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
-                now = time.perf_counter()
-                self.waiting_queue.extend([(i, r, now) for (i, r) in new_reqs])
-                # Reset error count on success
-                self._consecutive_error_count = 0
-            except Exception as e:
-                self._consecutive_error_count += 1
-                logger.error(
-                    f"Error receiving requests in scheduler event loop "
-                    f"(attempt {self._consecutive_error_count}/{self._max_consecutive_errors}): {e}",
-                    exc_info=True,
-                )
-                if self._consecutive_error_count >= self._max_consecutive_errors:
+            # 1: receive requests (only block when no queued tasks)
+            if not self.waiting_queue:
+                try:
+                    new_reqs = self.recv_reqs()
+                    new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+                    now = time.perf_counter()
+                    self.waiting_queue.extend([(i, r, now) for (i, r) in new_reqs])
+                    # Reset error count on success
+                    self._consecutive_error_count = 0
+                except Exception as e:
+                    self._consecutive_error_count += 1
                     logger.error(
-                        f"Maximum consecutive errors ({self._max_consecutive_errors}) reached. "
-                        "Terminating scheduler event loop."
+                        f"Error receiving requests in scheduler event loop "
+                        f"(attempt {self._consecutive_error_count}/{self._max_consecutive_errors}): {e}",
+                        exc_info=True,
                     )
-                    raise RuntimeError(
-                        f"Scheduler terminated after {self._max_consecutive_errors} "
-                        f"consecutive errors. Last error: {e}"
-                    ) from e
-                continue
+                    if self._consecutive_error_count >= self._max_consecutive_errors:
+                        logger.error(
+                            f"Maximum consecutive errors ({self._max_consecutive_errors}) reached. "
+                            "Terminating scheduler event loop."
+                        )
+                        raise RuntimeError(
+                            f"Scheduler terminated after {self._max_consecutive_errors} "
+                            f"consecutive errors. Last error: {e}"
+                        ) from e
+                    continue
 
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
