@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.models import (
     VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import (
@@ -342,6 +343,9 @@ class PipelineConfig:
         # general logic for video models
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         if latents.dim() != 5:
+            return latents, False
+
+        if isinstance(self.dit_config, WanVideoConfig):
             return latents, False
         time_dim = latents.shape[2]
 

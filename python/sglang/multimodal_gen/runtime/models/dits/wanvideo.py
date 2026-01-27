@@ -12,8 +12,12 @@ from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import divide
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
     get_sp_world_size,
     get_tensor_model_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
@@ -810,25 +814,51 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # The rotary embedding layer correctly handles SP offsets internally.
-        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
-            (
-                post_patch_num_frames * self.sp_size,
-                post_patch_height,
-                post_patch_width,
-            ),
-            shard_dim=0,
-            start_frame=0,
-            device=hidden_states.device,
-        )
-        assert freqs_cos.dtype == torch.float32
-        assert freqs_cos.device == hidden_states.device
-        freqs_cis = (
-            (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
-        )
-
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        original_seq_len = int(hidden_states.shape[1])
+
+        t = torch.arange(
+            post_patch_num_frames, device=hidden_states.device, dtype=torch.long
+        )
+        h = torch.arange(post_patch_height, device=hidden_states.device, dtype=torch.long)
+        w = torch.arange(post_patch_width, device=hidden_states.device, dtype=torch.long)
+        tt, hh, ww = torch.meshgrid(t, h, w, indexing="ij")
+        pos = torch.stack([tt, hh, ww], dim=-1).reshape(-1, 3)
+
+        freqs_cos, freqs_sin = self.rotary_emb.forward_uncached(pos)
+        freqs_cos = freqs_cos.to(device=hidden_states.device, dtype=torch.float32)
+        freqs_sin = freqs_sin.to(device=hidden_states.device, dtype=torch.float32)
+
+        sp_size = get_sp_world_size()
+        sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
+        pad_len = (sp_size - (original_seq_len % sp_size)) % sp_size
+        if pad_len:
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    hidden_states.new_zeros(
+                        (batch_size, pad_len, hidden_states.shape[2])
+                    ),
+                ],
+                dim=1,
+            )
+
+            head_dim_half = freqs_cos.shape[1]
+            freqs_cos = torch.cat(
+                [freqs_cos, freqs_cos.new_ones((pad_len, head_dim_half))], dim=0
+            )
+            freqs_sin = torch.cat(
+                [freqs_sin, freqs_sin.new_zeros((pad_len, head_dim_half))], dim=0
+            )
+
+        if sp_size > 1:
+            hidden_states = hidden_states.chunk(sp_size, dim=1)[sp_rank]
+            freqs_cos = freqs_cos.chunk(sp_size, dim=0)[sp_rank]
+            freqs_sin = freqs_sin.chunk(sp_size, dim=0)[sp_rank]
+
+        freqs_cis = (freqs_cos, freqs_sin)
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
             # ti2v
@@ -886,6 +916,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
         self.cnt += 1
+
+        if sp_size > 1:
+            hidden_states = sequence_model_parallel_all_gather(hidden_states, dim=1)
+            if pad_len:
+                hidden_states = hidden_states[:, :original_seq_len, :]
+
         # 5. Output norm, projection & unpatchify
         if temb.dim() == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
