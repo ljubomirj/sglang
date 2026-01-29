@@ -166,24 +166,24 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
     echo "Error: --gpu-arch is required when using --build-from-dockerfile" >&2
     exit 1
   fi
-  
+
   DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
-  
+
   # Use rocm720.Dockerfile for ROCm 7.2 builds, otherwise use rocm.Dockerfile
   if [[ "${GPU_ARCH_BUILD}" == *"rocm720"* ]]; then
     DOCKERFILE="${DOCKERFILE_DIR}/rocm720.Dockerfile"
   else
     DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
   fi
-  
+
   if [[ ! -f "${DOCKERFILE}" ]]; then
     echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2
     exit 1
   fi
-  
+
   IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
   echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
-  
+
   # Pass full GPU_ARCH (e.g., gfx950-rocm720) - Dockerfile handles stripping suffix
   docker build \
     --build-arg GPU_ARCH="${GPU_ARCH_BUILD}" \
