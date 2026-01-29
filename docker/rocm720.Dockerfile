@@ -122,9 +122,9 @@ RUN pip uninstall -y aiter
 RUN pip install psutil pybind11 # Required by AITER setup.py
 RUN git clone ${AITER_REPO} \
  && cd aiter \
- && sed -i setup.py -e 's/verbose.*/verbose=True,/' \
  && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive
+ && git submodule update --init --recursive \
+ && sed -i setup.py -e 's/verbose.*/verbose=True,/'
 ADD docker/aiter.patch ./aiter
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
