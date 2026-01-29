@@ -187,7 +187,7 @@ RUN pip uninstall -y sgl_kernel sglang
 ADD docker/sglang.patch ./sglang
 RUN git clone ${SGL_REPO} \
     && cd sglang \
-    && patch -p1 < sglang.patch
+    && patch -p1 < sglang.patch \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
          echo "Using ${SGL_DEFAULT}, default branch."; \
          git checkout ${SGL_DEFAULT}; \
