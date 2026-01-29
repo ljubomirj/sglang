@@ -233,6 +233,13 @@ class ComponentLoader(ABC):
             "video_dit",
         ]:
             transformers_or_diffusers = "diffusers"
+
+        if (
+            module_type == "scheduler"
+            and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
+        ):
+            transformers_or_diffusers = "diffusers"
+
         if module_type in component_name_to_loader_cls:
             loader_cls = component_name_to_loader_cls[module_type]
             expected_library = loader_cls_to_expected_library[loader_cls]
