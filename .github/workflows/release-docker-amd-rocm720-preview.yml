@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        gpu_arch: ['gfx942-rocm720']
         build_type: ['all']
     steps:
       - name: Checkout repository
