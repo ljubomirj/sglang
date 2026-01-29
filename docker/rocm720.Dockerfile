@@ -184,10 +184,8 @@ RUN pip install IPython \
     && pip install pybind11
 
 RUN pip uninstall -y sgl_kernel sglang
-ADD docker/sglang.patch /tmp/sglang.patch
 RUN git clone ${SGL_REPO} \
     && cd sglang \
-    && patch -p1 < /tmp/sglang.patch \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
          echo "Using ${SGL_DEFAULT}, default branch."; \
          git checkout ${SGL_DEFAULT}; \
