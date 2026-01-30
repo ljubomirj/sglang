@@ -184,6 +184,9 @@ def benchmark_config(
         top_k=topk,
         renormalize=True,
     )
+    if _is_hip:
+        # Avoid ROCm kernel issues in top-k during tuning by using torch native path.
+        topk_config.torch_native = True
     topk_output = select_experts(x, input_gating, topk_config)
 
     def prepare(i: int):

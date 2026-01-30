@@ -603,8 +603,9 @@ def fused_experts_impl(
                     out_hidden_states[begin_chunk_idx:end_chunk_idx],
                 )
             else:
-                # According to micro benchmark results, torch.compile can get better performance for small token.
-                if tokens_in_chunk <= 32:
+                # torch.compile path trips HIP launch failures with int4_w4a16 on ROCm.
+                # Use the triton reduce for that case to keep tuning and runtime stable.
+                if tokens_in_chunk <= 32 and not use_int4_w4a16:
                     moe_sum_reduce_torch_compile(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
