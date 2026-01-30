@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+from types import SimpleNamespace
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -48,7 +49,16 @@ if _is_cuda or _is_hip:
                     "aiter is required when SGLANG_USE_AITER is set to True"
                 )
         else:
-            from vllm import _custom_ops as vllm_ops  # moe_sum
+            try:
+                from vllm import _custom_ops as vllm_ops  # moe_sum
+            except ImportError:
+                from sgl_kernel import moe_sum as _sgl_moe_sum
+
+                vllm_ops = SimpleNamespace(
+                    silu_and_mul=silu_and_mul,
+                    gelu_and_mul=gelu_and_mul,
+                    moe_sum=_sgl_moe_sum,
+                )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 

@@ -90,7 +90,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
+        weight = layer.weight
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        if bias is not None and bias.dtype != weight.dtype:
+            bias = bias.to(weight.dtype)
+        return F.linear(x, weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
@@ -145,7 +150,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
-        return F.linear(x, layer.weight, bias)
+        weight = layer.weight
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        if bias is not None and bias.dtype != weight.dtype:
+            bias = bias.to(weight.dtype)
+        return F.linear(x, weight, bias)
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):

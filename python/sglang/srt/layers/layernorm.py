@@ -68,7 +68,21 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
-    from vllm._custom_ops import fused_add_rms_norm, rms_norm
+    try:
+        from vllm._custom_ops import fused_add_rms_norm, rms_norm
+    except ImportError:
+        def rms_norm(out, x, weight, eps):
+            y = x.float()
+            y = y * torch.rsqrt((y * y).mean(-1, keepdim=True) + eps)
+            y = y * weight
+            out.copy_(y.to(out.dtype))
+
+        def fused_add_rms_norm(out, x, residual_out, residual, weight, eps):
+            y = (x + residual).float()
+            residual_out.copy_((x + residual).to(residual_out.dtype))
+            y = y * torch.rsqrt((y * y).mean(-1, keepdim=True) + eps)
+            y = y * weight
+            out.copy_(y.to(out.dtype))
 
 logger = logging.getLogger(__name__)
 

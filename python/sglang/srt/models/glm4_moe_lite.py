@@ -133,15 +133,22 @@ class Glm4MoeLiteMLP(nn.Module):
             return x
 
         # Some quantization wrappers store the underlying parameter as `weight_packed`.
-        if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
-        if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+        gate_weight = getattr(self.gate_up_proj, "weight", None)
+        if gate_weight is None:
+            gate_weight = getattr(self.gate_up_proj, "weight_packed", None)
+            if gate_weight is not None:
+                self.gate_up_proj.weight = gate_weight
+        down_weight = getattr(self.down_proj, "weight", None)
+        if down_weight is None:
+            down_weight = getattr(self.down_proj, "weight_packed", None)
+            if down_weight is not None:
+                self.down_proj.weight = down_weight
 
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
-            and self.gate_up_proj.weight.dtype == torch.uint8
+            and gate_weight is not None
+            and gate_weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition

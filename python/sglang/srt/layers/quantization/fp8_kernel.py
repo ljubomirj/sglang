@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import warnings
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -77,7 +78,10 @@ if _is_hip:
         try:
             import vllm._C  # noqa: F401
         except ImportError:
-            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
+            warnings.warn(
+                "vllm not found; fp8 kernel on HIP may be unavailable when "
+                "SGLANG_USE_AITER is set to False."
+            )
 
 logger = logging.getLogger(__name__)
 

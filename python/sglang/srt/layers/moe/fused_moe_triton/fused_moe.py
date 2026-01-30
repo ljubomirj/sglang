@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -54,7 +55,16 @@ elif _is_hip:
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
-        from vllm import _custom_ops as vllm_ops
+        try:
+            from vllm import _custom_ops as vllm_ops
+        except ImportError:
+            from sgl_kernel import moe_sum as _sgl_moe_sum
+
+            vllm_ops = SimpleNamespace(
+                silu_and_mul=silu_and_mul,
+                gelu_and_mul=gelu_and_mul,
+                moe_sum=_sgl_moe_sum,
+            )
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
