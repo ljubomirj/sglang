@@ -11,6 +11,8 @@
 #include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPGuard.h>
 
+#include <type_traits>
+
 namespace {
 
 constexpr int kWarpSize = 32;
@@ -41,15 +43,26 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
   return val;
 }
 
+template <typename T>
+__device__ __forceinline__ float to_float(T val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ __forceinline__ float to_float<half>(half val) {
+  return __half2float(val);
+}
+
+template <typename Q, typename Out>
 __global__ void decode_int8_kv_kernel(
-    const half* __restrict__ q,
+    const Q* __restrict__ q,
     const int8_t* __restrict__ k_cache,
     const int8_t* __restrict__ v_cache,
     const half* __restrict__ k_scale,
     const half* __restrict__ v_scale,
     const int32_t* __restrict__ kv_indptr,
     const int32_t* __restrict__ kv_indices,
-    half* __restrict__ out,
+    Out* __restrict__ out,
     int32_t batch_size,
     int32_t head_num,
     int32_t kv_head_num,
@@ -94,12 +107,12 @@ __global__ void decode_int8_kv_kernel(
   }
 
   extern __shared__ char smem[];
-  half* q_shared = reinterpret_cast<half*>(smem);
+  float* q_shared = reinterpret_cast<float*>(smem);
   float* acc_shared = reinterpret_cast<float*>(q_shared + qk_head_dim);
 
   // Load q into shared memory.
   for (int d = lane; d < qk_head_dim; d += kWarpSize) {
-    q_shared[d] = q[b * stride_qbs + h * stride_qh + d];
+    q_shared[d] = to_float(q[b * stride_qbs + h * stride_qh + d]);
   }
 
   if (lane == 0) {
@@ -135,8 +148,7 @@ __global__ void decode_int8_kv_kernel(
           int idx = g + d;
           int8_t k_val = k_cache[token_idx * stride_kbs + kv_head * stride_kh + idx];
           float kf = static_cast<float>(k_val) * scale;
-          float qf = __half2float(q_shared[idx]);
-          sum += qf * kf;
+          sum += q_shared[idx] * kf;
         }
       }
       qk = sum * sm_scale;
@@ -199,7 +211,11 @@ __global__ void decode_int8_kv_kernel(
     float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
     for (int d = 0; d < v_head_dim; ++d) {
       float out_val = acc_shared[d] * inv_l;
-      out[b * stride_obs + h * stride_oh + d] = __float2half(out_val);
+      if constexpr (std::is_same<Out, half>::value) {
+        out[b * stride_obs + h * stride_oh + d] = __float2half(out_val);
+      } else {
+        out[b * stride_obs + h * stride_oh + d] = out_val;
+      }
     }
   }
 }
@@ -232,12 +248,16 @@ void decode_attention_int8_kv(
   TORCH_CHECK(output.is_cuda(), "output must be CUDA/HIP");
   TORCH_CHECK(kv_indptr.is_cuda(), "kv_indptr must be CUDA/HIP");
   TORCH_CHECK(kv_indices.is_cuda(), "kv_indices must be CUDA/HIP");
-  TORCH_CHECK(q.scalar_type() == at::kHalf, "q must be float16");
+  TORCH_CHECK(
+      q.scalar_type() == at::kHalf || q.scalar_type() == at::kFloat,
+      "q must be float16 or float32");
   TORCH_CHECK(k_cache.scalar_type() == at::kChar, "k_cache must be int8");
   TORCH_CHECK(v_cache.scalar_type() == at::kChar, "v_cache must be int8");
   TORCH_CHECK(k_scale.scalar_type() == at::kHalf, "k_scale must be float16");
   TORCH_CHECK(v_scale.scalar_type() == at::kHalf, "v_scale must be float16");
-  TORCH_CHECK(output.scalar_type() == at::kHalf, "output must be float16");
+  TORCH_CHECK(
+      output.scalar_type() == at::kHalf || output.scalar_type() == at::kFloat,
+      "output must be float16 or float32");
   TORCH_CHECK(kv_indptr.scalar_type() == at::kInt, "kv_indptr must be int32");
   TORCH_CHECK(kv_indices.scalar_type() == at::kInt, "kv_indices must be int32");
   TORCH_CHECK(
@@ -250,74 +270,213 @@ void decode_attention_int8_kv(
   const dim3 grid(batch_size, head_num, 1);
   const dim3 block(kWarpSize, 1, 1);
   size_t shared_bytes =
-      sizeof(half) * qk_head_dim + sizeof(float) * v_head_dim;
+      sizeof(float) * qk_head_dim + sizeof(float) * v_head_dim;
 
   const auto stream = at::cuda::getDefaultCUDAStream();
 
+  const bool q_is_fp16 = q.scalar_type() == at::kHalf;
+  const bool out_is_fp16 = output.scalar_type() == at::kHalf;
+  if (!out_is_fp16 && q_is_fp16) {
+    TORCH_CHECK(false, "float32 output requires float32 q");
+  }
 #if defined(__HIPCC__)
-  hipLaunchKernelGGL(
-      decode_int8_kv_kernel,
-      grid,
-      block,
-      shared_bytes,
-      stream,
-      reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-      reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-      reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-      reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-      reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-      reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-      reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-      static_cast<int32_t>(batch_size),
-      static_cast<int32_t>(head_num),
-      static_cast<int32_t>(kv_head_num),
-      static_cast<int32_t>(qk_head_dim),
-      static_cast<int32_t>(v_head_dim),
-      static_cast<int32_t>(kv_group_size),
-      q.stride(0),
-      q.stride(1),
-      k_cache.stride(0),
-      k_cache.stride(1),
-      v_cache.stride(0),
-      v_cache.stride(1),
-      k_scale.stride(0),
-      k_scale.stride(1),
-      v_scale.stride(0),
-      v_scale.stride(1),
-      output.stride(0),
-      output.stride(1),
-      static_cast<float>(sm_scale),
-      static_cast<float>(logit_cap));
+  if (out_is_fp16 && q_is_fp16) {
+    hipLaunchKernelGGL(
+        (decode_int8_kv_kernel<half, half>),
+        grid,
+        block,
+        shared_bytes,
+        stream,
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
+        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
+        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
+        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        static_cast<int32_t>(batch_size),
+        static_cast<int32_t>(head_num),
+        static_cast<int32_t>(kv_head_num),
+        static_cast<int32_t>(qk_head_dim),
+        static_cast<int32_t>(v_head_dim),
+        static_cast<int32_t>(kv_group_size),
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        output.stride(0),
+        output.stride(1),
+        static_cast<float>(sm_scale),
+        static_cast<float>(logit_cap));
+  } else if (out_is_fp16 && !q_is_fp16) {
+    hipLaunchKernelGGL(
+        (decode_int8_kv_kernel<float, half>),
+        grid,
+        block,
+        shared_bytes,
+        stream,
+        reinterpret_cast<float*>(q.data_ptr<float>()),
+        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
+        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
+        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
+        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        static_cast<int32_t>(batch_size),
+        static_cast<int32_t>(head_num),
+        static_cast<int32_t>(kv_head_num),
+        static_cast<int32_t>(qk_head_dim),
+        static_cast<int32_t>(v_head_dim),
+        static_cast<int32_t>(kv_group_size),
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        output.stride(0),
+        output.stride(1),
+        static_cast<float>(sm_scale),
+        static_cast<float>(logit_cap));
+  } else {
+    hipLaunchKernelGGL(
+        (decode_int8_kv_kernel<float, float>),
+        grid,
+        block,
+        shared_bytes,
+        stream,
+        reinterpret_cast<float*>(q.data_ptr<float>()),
+        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
+        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
+        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
+        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
+        reinterpret_cast<float*>(output.data_ptr<float>()),
+        static_cast<int32_t>(batch_size),
+        static_cast<int32_t>(head_num),
+        static_cast<int32_t>(kv_head_num),
+        static_cast<int32_t>(qk_head_dim),
+        static_cast<int32_t>(v_head_dim),
+        static_cast<int32_t>(kv_group_size),
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        output.stride(0),
+        output.stride(1),
+        static_cast<float>(sm_scale),
+        static_cast<float>(logit_cap));
+  }
 #else
- hipLaunchKernelGGL(( decode_int8_kv_kernel), dim3(grid), dim3(block), shared_bytes, stream, 
-      reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-      reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-      reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-      reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-      reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-      reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-      reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-      static_cast<int32_t>(batch_size),
-      static_cast<int32_t>(head_num),
-      static_cast<int32_t>(kv_head_num),
-      static_cast<int32_t>(qk_head_dim),
-      static_cast<int32_t>(v_head_dim),
-      static_cast<int32_t>(kv_group_size),
-      q.stride(0),
-      q.stride(1),
-      k_cache.stride(0),
-      k_cache.stride(1),
-      v_cache.stride(0),
-      v_cache.stride(1),
-      k_scale.stride(0),
-      k_scale.stride(1),
-      v_scale.stride(0),
-      v_scale.stride(1),
-      output.stride(0),
-      output.stride(1),
-      static_cast<float>(sm_scale),
-      static_cast<float>(logit_cap));
+  if (out_is_fp16 && q_is_fp16) {
+   hipLaunchKernelGGL(( decode_int8_kv_kernel<half, half>), dim3(grid), dim3(block), shared_bytes, stream, 
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
+        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
+        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
+        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        static_cast<int32_t>(batch_size),
+        static_cast<int32_t>(head_num),
+        static_cast<int32_t>(kv_head_num),
+        static_cast<int32_t>(qk_head_dim),
+        static_cast<int32_t>(v_head_dim),
+        static_cast<int32_t>(kv_group_size),
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        output.stride(0),
+        output.stride(1),
+        static_cast<float>(sm_scale),
+        static_cast<float>(logit_cap));
+  } else if (out_is_fp16 && !q_is_fp16) {
+   hipLaunchKernelGGL(( decode_int8_kv_kernel<float, half>), dim3(grid), dim3(block), shared_bytes, stream, 
+        reinterpret_cast<float*>(q.data_ptr<float>()),
+        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
+        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
+        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
+        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        static_cast<int32_t>(batch_size),
+        static_cast<int32_t>(head_num),
+        static_cast<int32_t>(kv_head_num),
+        static_cast<int32_t>(qk_head_dim),
+        static_cast<int32_t>(v_head_dim),
+        static_cast<int32_t>(kv_group_size),
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        output.stride(0),
+        output.stride(1),
+        static_cast<float>(sm_scale),
+        static_cast<float>(logit_cap));
+  } else {
+   hipLaunchKernelGGL(( decode_int8_kv_kernel<float, float>), dim3(grid), dim3(block), shared_bytes, stream, 
+        reinterpret_cast<float*>(q.data_ptr<float>()),
+        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
+        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
+        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
+        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
+        reinterpret_cast<float*>(output.data_ptr<float>()),
+        static_cast<int32_t>(batch_size),
+        static_cast<int32_t>(head_num),
+        static_cast<int32_t>(kv_head_num),
+        static_cast<int32_t>(qk_head_dim),
+        static_cast<int32_t>(v_head_dim),
+        static_cast<int32_t>(kv_group_size),
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        output.stride(0),
+        output.stride(1),
+        static_cast<float>(sm_scale),
+        static_cast<float>(logit_cap));
+  }
 #endif
 }

@@ -52,6 +52,10 @@ class ForwardMetadata:
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
     window_kv_offsets: torch.Tensor
+    kv_indptr_i32: Optional[torch.Tensor]
+    kv_indices_i32: Optional[torch.Tensor]
+    window_kv_indptr_i32: Optional[torch.Tensor]
+    window_kv_indices_i32: Optional[torch.Tensor]
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -431,6 +435,10 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
+            None,
+            None,
+            None,
+            None,
         )
 
     def init_cuda_graph_state(
@@ -654,6 +662,10 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
+            None,
+            None,
+            None,
+            None,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -1008,10 +1020,19 @@ class TritonAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         # TODO: reuse the buffer across layers
+        use_int8_kv_hip = self._use_int8_kv_hip and (
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).dtype
+            == torch.int8
+        )
+        o_dtype = torch.float16 if use_int8_kv_hip else q.dtype
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = torch.empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                dtype=o_dtype,
+                device=q.device,
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=o_dtype)
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
@@ -1020,9 +1041,11 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        use_window_buffers = False
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
+            use_window_buffers = True
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
@@ -1042,9 +1065,12 @@ class TritonAttnBackend(AttentionBackend):
             kv_group_size,
             logits_soft_cap,
             sinks,
+            use_window_buffers,
         ):
             return o
 
+        if o.dtype != q.dtype:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1079,6 +1105,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_group_size: int,
         logit_cap: float,
         sinks: Optional[torch.Tensor],
+        use_window_buffers: bool,
     ) -> bool:
         debug = get_bool_env_var("SGLANG_INT8_KV_HIP_DEBUG")
         if debug and not self._int8_kv_hip_debugged:
@@ -1120,33 +1147,12 @@ class TritonAttnBackend(AttentionBackend):
 
         try:
             q_kernel = q
-            if q.dtype == torch.float32:
-                if debug:
-                    logging.getLogger(__name__).warning(
-                        "int8_kv_hip: casting q from float32 to float16 for custom kernel"
-                    )
-                q_kernel = q.to(torch.float16)
             o_kernel = o
-            if o.dtype != torch.float16:
-                if debug:
-                    logging.getLogger(__name__).warning(
-                        "int8_kv_hip: using float16 temp output for custom kernel"
-                    )
-                o_kernel = torch.empty_like(o, dtype=torch.float16)
-            kv_indptr_i32 = kv_indptr
-            kv_indices_i32 = kv_indices
-            if kv_indptr.dtype != torch.int32:
-                if debug:
-                    logging.getLogger(__name__).warning(
-                        "int8_kv_hip: casting kv_indptr from %s to int32", kv_indptr.dtype
-                    )
-                kv_indptr_i32 = kv_indptr.to(torch.int32)
-            if kv_indices.dtype != torch.int32:
-                if debug:
-                    logging.getLogger(__name__).warning(
-                        "int8_kv_hip: casting kv_indices from %s to int32", kv_indices.dtype
-                    )
-                kv_indices_i32 = kv_indices.to(torch.int32)
+            if o.dtype not in (torch.float16, torch.float32):
+                return False
+            kv_indptr_i32, kv_indices_i32 = self._get_kv_i32(
+                kv_indptr, kv_indices, use_window_buffers
+            )
             if debug:
                 logging.getLogger(__name__).warning(
                     "int8_kv_hip launch: q=%s o=%s k=%s v=%s k_scale=%s v_scale=%s kv_indptr=%s kv_indices=%s kv_group_size=%s",
@@ -1190,19 +1196,12 @@ class TritonAttnBackend(AttentionBackend):
                         can_sync = True
                 if can_sync:
                     torch.cuda.synchronize()
-            if o_kernel is not o:
-                o.copy_(o_kernel)
             if not self._int8_kv_hip_logged:
                 logging.getLogger(__name__).info(
                     "Using custom HIP int8 KV decode kernel"
                 )
                 if get_bool_env_var("SGLANG_INT8_KV_HIP_DEBUG"):
                     print("[SGLANG] Using custom HIP int8 KV decode kernel")
-                self._int8_kv_hip_logged = True
-            if not self._int8_kv_hip_logged:
-                logging.getLogger(__name__).info(
-                    "Using custom HIP int8 KV decode kernel"
-                )
                 self._int8_kv_hip_logged = True
             return True
         except Exception as e:
@@ -1211,6 +1210,47 @@ class TritonAttnBackend(AttentionBackend):
                     "Custom HIP int8 KV decode kernel failed: %s", e
                 )
             return False
+
+    def _get_kv_i32(
+        self,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        use_window_buffers: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if kv_indptr.dtype == torch.int32 and kv_indices.dtype == torch.int32:
+            return kv_indptr, kv_indices
+
+        if self.forward_metadata is None:
+            return kv_indptr.to(torch.int32), kv_indices.to(torch.int32)
+
+        if use_window_buffers:
+            kv_indptr_i32 = self.forward_metadata.window_kv_indptr_i32
+            kv_indices_i32 = self.forward_metadata.window_kv_indices_i32
+        else:
+            kv_indptr_i32 = self.forward_metadata.kv_indptr_i32
+            kv_indices_i32 = self.forward_metadata.kv_indices_i32
+
+        if kv_indptr.dtype != torch.int32:
+            if kv_indptr_i32 is None or kv_indptr_i32.shape != kv_indptr.shape:
+                kv_indptr_i32 = kv_indptr.to(torch.int32)
+                if use_window_buffers:
+                    self.forward_metadata.window_kv_indptr_i32 = kv_indptr_i32
+                else:
+                    self.forward_metadata.kv_indptr_i32 = kv_indptr_i32
+        else:
+            kv_indptr_i32 = kv_indptr
+
+        if kv_indices.dtype != torch.int32:
+            if kv_indices_i32 is None or kv_indices_i32.shape != kv_indices.shape:
+                kv_indices_i32 = kv_indices.to(torch.int32)
+                if use_window_buffers:
+                    self.forward_metadata.window_kv_indices_i32 = kv_indices_i32
+                else:
+                    self.forward_metadata.kv_indices_i32 = kv_indices_i32
+        else:
+            kv_indices_i32 = kv_indices
+
+        return kv_indptr_i32, kv_indices_i32
 
 
 class TritonMultiStepDraftBackend:
