@@ -176,25 +176,28 @@ __global__ void decode_int8_kv_kernel(
     __syncthreads();
 #endif
 
-    if (valid) {
-      for (int g = 0; g < v_head_dim; g += kv_group_size) {
-        int scale_idx = g / kv_group_size;
-        float scale = __half2float(
-            v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
-        for (int d = 0; d < kv_group_size && (g + d) < v_head_dim; ++d) {
-          int idx = g + d;
-          int8_t v_val = v_cache[token_idx * stride_vbs + kv_head * stride_vh + idx];
-          float contrib = p * (static_cast<float>(v_val) * scale);
-          float sum = warp_reduce_sum(contrib);
-          if (lane == 0) {
-            acc_shared[idx] += sum;
-          }
-#if defined(__HIPCC__)
-          __syncthreads();
-#else
-          __syncthreads();
-#endif
+    for (int g = 0; g < v_head_dim; g += kv_group_size) {
+      int scale_idx = g / kv_group_size;
+      float scale = valid
+                        ? __half2float(v_scale[token_idx * stride_vs +
+                                              kv_head * stride_vsh + scale_idx])
+                        : 0.0f;
+      for (int d = 0; d < kv_group_size && (g + d) < v_head_dim; ++d) {
+        int idx = g + d;
+        int8_t v_val = valid
+                           ? v_cache[token_idx * stride_vbs +
+                                     kv_head * stride_vh + idx]
+                           : 0;
+        float contrib = p * (static_cast<float>(v_val) * scale);
+        float sum = warp_reduce_sum(contrib);
+        if (lane == 0) {
+          acc_shared[idx] += sum;
         }
+#if defined(__HIPCC__)
+        __syncthreads();
+#else
+        __syncthreads();
+#endif
       }
     }
 
