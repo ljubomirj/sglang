@@ -68,6 +68,7 @@ __global__ void decode_int8_kv_kernel(
     int32_t qk_head_dim,
     int32_t v_head_dim,
     int32_t kv_group_size,
+    int32_t max_tokens,
     int64_t stride_qbs,
     int64_t stride_qh,
     int64_t stride_kbs,
@@ -135,9 +136,10 @@ __global__ void decode_int8_kv_kernel(
     int32_t kv_idx = start + lane;
     bool valid = kv_idx < kv_end;
     int32_t token_idx = valid ? kv_indices[kv_idx] : 0;
+    bool token_valid = valid && token_idx >= 0 && token_idx < max_tokens;
 
     float qk = -INFINITY;
-    if (valid) {
+    if (token_valid) {
       float sum = 0.0f;
       for (int g = 0; g < qk_head_dim; g += kv_group_size) {
         int scale_idx = g / kv_group_size;
@@ -160,7 +162,7 @@ __global__ void decode_int8_kv_kernel(
     float m_new = fmaxf(m, block_max);
 
     float exp_scale = (m == -INFINITY) ? 0.0f : expf(m - m_new);
-    float p = valid ? expf(qk - m_new) : 0.0f;
+    float p = token_valid ? expf(qk - m_new) : 0.0f;
     float p_sum = warp_reduce_sum(p);
     float l_new = l * exp_scale + p_sum;
 
@@ -177,13 +179,13 @@ __global__ void decode_int8_kv_kernel(
 
     for (int g = 0; g < v_head_dim; g += kv_group_size) {
       int scale_idx = g / kv_group_size;
-      float scale = valid
-                        ? __half2float(v_scale[token_idx * stride_vs +
-                                              kv_head * stride_vsh + scale_idx])
-                        : 0.0f;
+    float scale = token_valid
+                      ? __half2float(v_scale[token_idx * stride_vs +
+                                            kv_head * stride_vsh + scale_idx])
+                      : 0.0f;
       for (int d = 0; d < kv_group_size && (g + d) < v_head_dim; ++d) {
         int idx = g + d;
-        int8_t v_val = valid
+        int8_t v_val = token_valid
                            ? v_cache[token_idx * stride_vbs +
                                      kv_head * stride_vh + idx]
                            : 0;
@@ -241,6 +243,7 @@ void decode_attention_int8_kv(
   const auto qk_head_dim = q.size(2);
   const auto v_head_dim = v_cache.size(2);
   const auto kv_head_num = k_cache.size(1);
+  const auto max_tokens = k_cache.size(0);
 
   TORCH_CHECK(q.is_cuda(), "q must be CUDA/HIP");
   TORCH_CHECK(k_cache.is_cuda(), "k_cache must be CUDA/HIP");
@@ -303,6 +306,7 @@ void decode_attention_int8_kv(
         static_cast<int32_t>(qk_head_dim),
         static_cast<int32_t>(v_head_dim),
         static_cast<int32_t>(kv_group_size),
+        static_cast<int32_t>(max_tokens),
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -338,6 +342,7 @@ void decode_attention_int8_kv(
         static_cast<int32_t>(qk_head_dim),
         static_cast<int32_t>(v_head_dim),
         static_cast<int32_t>(kv_group_size),
+        static_cast<int32_t>(max_tokens),
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -373,6 +378,7 @@ void decode_attention_int8_kv(
         static_cast<int32_t>(qk_head_dim),
         static_cast<int32_t>(v_head_dim),
         static_cast<int32_t>(kv_group_size),
+        static_cast<int32_t>(max_tokens),
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -405,6 +411,7 @@ void decode_attention_int8_kv(
         static_cast<int32_t>(qk_head_dim),
         static_cast<int32_t>(v_head_dim),
         static_cast<int32_t>(kv_group_size),
+        static_cast<int32_t>(max_tokens),
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -435,6 +442,7 @@ void decode_attention_int8_kv(
         static_cast<int32_t>(qk_head_dim),
         static_cast<int32_t>(v_head_dim),
         static_cast<int32_t>(kv_group_size),
+        static_cast<int32_t>(max_tokens),
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -465,6 +473,7 @@ void decode_attention_int8_kv(
         static_cast<int32_t>(qk_head_dim),
         static_cast<int32_t>(v_head_dim),
         static_cast<int32_t>(kv_group_size),
+        static_cast<int32_t>(max_tokens),
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
