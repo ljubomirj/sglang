@@ -16,6 +16,8 @@
 namespace {
 
 constexpr int kWarpSize = 32;
+constexpr int kMaxVHeadDim = 1024;
+constexpr int kMaxVPerLane = (kMaxVHeadDim + kWarpSize - 1) / kWarpSize;
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
 #if defined(__HIPCC__)
@@ -109,23 +111,27 @@ __global__ void decode_int8_kv_kernel(
 
   extern __shared__ char smem[];
   float* q_shared = reinterpret_cast<float*>(smem);
-  float* acc_shared = reinterpret_cast<float*>(q_shared + qk_head_dim);
+  float acc[kMaxVPerLane];
 
   // Load q into shared memory.
   for (int d = lane; d < qk_head_dim; d += kWarpSize) {
     q_shared[d] = to_float(q[b * stride_qbs + h * stride_qh + d]);
   }
 
-  if (lane == 0) {
-    for (int d = 0; d < v_head_dim; ++d) {
-      acc_shared[d] = 0.0f;
-    }
-  }
 #if defined(__HIPCC__)
   __syncthreads();
 #else
   __syncthreads();
 #endif
+
+  if (v_head_dim > kMaxVHeadDim) {
+    return;
+  }
+
+  int v_per_lane = (v_head_dim + kWarpSize - 1) / kWarpSize;
+  for (int i = 0; i < v_per_lane; ++i) {
+    acc[i] = 0.0f;
+  }
 
   int32_t kv_start = kv_indptr[b];
   int32_t kv_end = kv_indptr[b + 1];
@@ -133,94 +139,58 @@ __global__ void decode_int8_kv_kernel(
   float m = -INFINITY;
   float l = 0.0f;
 
-  for (int32_t start = kv_start; start < kv_end; start += kWarpSize) {
-    int32_t kv_idx = start + lane;
-    bool valid = kv_idx < kv_end;
-    int32_t token_idx = valid ? kv_indices[kv_idx] : 0;
-    bool token_valid = valid && token_idx >= 0 && token_idx < max_tokens;
+  for (int32_t kv_idx = kv_start; kv_idx < kv_end; ++kv_idx) {
+    int32_t token_idx = kv_indices[kv_idx];
+    bool token_valid = token_idx >= 0 && token_idx < max_tokens;
 
     float qk = -INFINITY;
     if (token_valid) {
-      float sum = 0.0f;
-      for (int g = 0; g < qk_head_dim; g += kv_group_size) {
-        int scale_idx = g / kv_group_size;
+      float partial = 0.0f;
+      for (int d = lane; d < qk_head_dim; d += kWarpSize) {
+        int scale_idx = d / kv_group_size;
         float scale = __half2float(
             k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
-        for (int d = 0; d < kv_group_size && (g + d) < qk_head_dim; ++d) {
-          int idx = g + d;
-          int8_t k_val = k_cache[token_idx * stride_kbs + kv_head * stride_kh + idx];
-          float kf = static_cast<float>(k_val) * scale;
-          sum += q_shared[idx] * kf;
-        }
+        int8_t k_val = k_cache[token_idx * stride_kbs + kv_head * stride_kh + d];
+        partial += q_shared[d] * (static_cast<float>(k_val) * scale);
       }
-      qk = sum * sm_scale;
+      qk = warp_reduce_sum(partial) * sm_scale;
       if (logit_cap > 0.0f) {
         qk = logit_cap * tanhf(qk / logit_cap);
       }
     }
 
-    float block_max = warp_reduce_max(qk);
-    float m_new = fmaxf(m, block_max);
-
+    float m_new = fmaxf(m, qk);
     float exp_scale = (m == -INFINITY) ? 0.0f : expf(m - m_new);
     float p = token_valid ? expf(qk - m_new) : 0.0f;
-    float p_sum = warp_reduce_sum(p);
-    float l_new = l * exp_scale + p_sum;
+    float l_new = l * exp_scale + p;
 
-    if (lane == 0 && exp_scale != 1.0f) {
-      for (int d = 0; d < v_head_dim; ++d) {
-        acc_shared[d] *= exp_scale;
-      }
+    for (int i = 0; i < v_per_lane; ++i) {
+      acc[i] *= exp_scale;
     }
-#if defined(__HIPCC__)
-    __syncthreads();
-#else
-    __syncthreads();
-#endif
 
-    for (int g = 0; g < v_head_dim; g += kv_group_size) {
-      int scale_idx = g / kv_group_size;
-    float scale = token_valid
-                      ? __half2float(v_scale[token_idx * stride_vs +
-                                            kv_head * stride_vsh + scale_idx])
-                      : 0.0f;
-      for (int d = 0; d < kv_group_size && (g + d) < v_head_dim; ++d) {
-        int idx = g + d;
-        int8_t v_val = token_valid
-                           ? v_cache[token_idx * stride_vbs +
-                                     kv_head * stride_vh + idx]
-                           : 0;
-        float contrib = p * (static_cast<float>(v_val) * scale);
-        float sum = warp_reduce_sum(contrib);
-        if (lane == 0) {
-          acc_shared[idx] += sum;
-        }
-#if defined(__HIPCC__)
-        __syncthreads();
-#else
-        __syncthreads();
-#endif
+    if (token_valid && p != 0.0f) {
+      int acc_idx = 0;
+      for (int d = lane; d < v_head_dim; d += kWarpSize, ++acc_idx) {
+        int scale_idx = d / kv_group_size;
+        float scale = __half2float(
+            v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
+        int8_t v_val = v_cache[token_idx * stride_vbs + kv_head * stride_vh + d];
+        acc[acc_idx] += p * (static_cast<float>(v_val) * scale);
       }
     }
 
     m = m_new;
     l = l_new;
-#if defined(__HIPCC__)
-    __syncthreads();
-#else
-    __syncthreads();
-#endif
   }
 
-  if (lane == 0) {
-    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    for (int d = 0; d < v_head_dim; ++d) {
-      float out_val = acc_shared[d] * inv_l;
-      if constexpr (std::is_same<Out, half>::value) {
-        out[b * stride_obs + h * stride_oh + d] = __float2half(out_val);
-      } else {
-        out[b * stride_obs + h * stride_oh + d] = out_val;
-      }
+  float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+  int acc_idx = 0;
+  for (int d = lane; d < v_head_dim; d += kWarpSize, ++acc_idx) {
+    float out_val = acc[acc_idx] * inv_l;
+    if constexpr (std::is_same<Out, half>::value) {
+      out[b * stride_obs + h * stride_oh + d] = __float2half(out_val);
+    } else {
+      out[b * stride_obs + h * stride_oh + d] = out_val;
     }
   }
 }
@@ -272,6 +242,9 @@ void decode_attention_int8_kv(
   TORCH_CHECK(
       v_head_dim % kv_group_size == 0,
       "v_head_dim must be divisible by kv_group_size");
+  TORCH_CHECK(
+      v_head_dim <= kMaxVHeadDim,
+      "v_head_dim exceeds kernel limit");
 
   const dim3 grid(batch_size, head_num, 1);
   const dim3 block(kWarpSize, 1, 1);
