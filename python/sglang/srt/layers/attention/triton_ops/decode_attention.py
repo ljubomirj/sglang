@@ -46,6 +46,8 @@ def _fwd_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
+    K_Scale_Buffer,
+    V_Scale_Buffer,
     sm_scale,
     kv_indptr,
     kv_indices,
@@ -58,10 +60,16 @@ def _fwd_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_ks,
+    stride_buf_ksh,
+    stride_buf_vs,
+    stride_buf_vsh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
     kv_group_num: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    USE_INT8_KV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -123,6 +131,19 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
+            if USE_INT8_KV:
+                offs_g = offs_d // KV_GROUP_SIZE
+                offs_buf_ks = (
+                    kv_loc[:, None] * stride_buf_ks
+                    + cur_kv_head * stride_buf_ksh
+                    + offs_g[None, :]
+                )
+                k_scale = tl.load(
+                    K_Scale_Buffer + offs_buf_ks,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                    other=1.0,
+                )
+                k = k.to(tl.float16) * k_scale
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
 
@@ -144,6 +165,19 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                 other=0.0,
             )
+            if USE_INT8_KV:
+                offs_gv = offs_dv // KV_GROUP_SIZE
+                offs_buf_vs = (
+                    kv_loc[:, None] * stride_buf_vs
+                    + cur_kv_head * stride_buf_vsh
+                    + offs_gv[None, :]
+                )
+                v_scale = tl.load(
+                    V_Scale_Buffer + offs_buf_vs,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=1.0,
+                )
+                v = v.to(tl.float16) * v_scale
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -192,6 +226,9 @@ def _decode_att_m_fwd(
     sm_scale,
     logit_cap,
     xai_temperature_len=-1,
+    kv_group_size=128,
+    k_scale_buffer=None,
+    v_scale_buffer=None,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -216,10 +253,16 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
+    use_int8_kv = k_scale_buffer is not None and v_scale_buffer is not None
+    if not use_int8_kv:
+        k_scale_buffer = k_buffer
+        v_scale_buffer = v_buffer
     _fwd_kernel_stage1[grid](
         q,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         sm_scale,
         kv_indptr,
         kv_indices,
@@ -232,10 +275,16 @@ def _decode_att_m_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
+        k_scale_buffer.stride(0) if use_int8_kv else 0,
+        k_scale_buffer.stride(1) if use_int8_kv else 0,
+        v_scale_buffer.stride(0) if use_int8_kv else 0,
+        v_scale_buffer.stride(1) if use_int8_kv else 0,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
         kv_group_num=kv_group_num,
+        KV_GROUP_SIZE=kv_group_size,
+        USE_INT8_KV=use_int8_kv,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
@@ -254,6 +303,8 @@ def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
     V_Buffer,
+    K_Scale_Buffer,
+    V_Scale_Buffer,
     sm_scale,
     kv_indptr,
     kv_indices,
@@ -266,11 +317,17 @@ def _fwd_grouped_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_ks,
+    stride_buf_ksh,
+    stride_buf_vs,
+    stride_buf_vsh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    USE_INT8_KV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -352,6 +409,19 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
+            if USE_INT8_KV:
+                offs_g = offs_d // KV_GROUP_SIZE
+                offs_buf_ks = (
+                    kv_loc[None, :] * stride_buf_ks
+                    + cur_kv_head * stride_buf_ksh
+                    + offs_g[:, None]
+                )
+                k_scale = tl.load(
+                    K_Scale_Buffer + offs_buf_ks,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                    other=1.0,
+                )
+                k = k.to(tl.float16) * k_scale
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
@@ -364,6 +434,19 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
                     other=0.0,
                 )
+                if USE_INT8_KV:
+                    offs_gpe = offs_dpe // KV_GROUP_SIZE
+                    offs_buf_kpe_s = (
+                        kv_loc[None, :] * stride_buf_ks
+                        + cur_kv_head * stride_buf_ksh
+                        + offs_gpe[:, None]
+                    )
+                    kpe_scale = tl.load(
+                        K_Scale_Buffer + offs_buf_kpe_s,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=1.0,
+                    )
+                    kpe = kpe.to(tl.float16) * kpe_scale
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
 
@@ -387,6 +470,19 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                 other=0.0,
             )
+            if USE_INT8_KV:
+                offs_gv = offs_dv // KV_GROUP_SIZE
+                offs_buf_vs = (
+                    kv_loc[:, None] * stride_buf_vs
+                    + cur_kv_head * stride_buf_vsh
+                    + offs_gv[None, :]
+                )
+                v_scale = tl.load(
+                    V_Scale_Buffer + offs_buf_vs,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=1.0,
+                )
+                v = v.to(tl.float16) * v_scale
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -436,6 +532,9 @@ def _decode_grouped_att_m_fwd(
     sm_scale,
     logit_cap,
     xai_temperature_len=-1,
+    kv_group_size=128,
+    k_scale_buffer=None,
+    v_scale_buffer=None,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -475,10 +574,16 @@ def _decode_grouped_att_m_fwd(
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
 
+    use_int8_kv = k_scale_buffer is not None and v_scale_buffer is not None
+    if not use_int8_kv:
+        k_scale_buffer = k_buffer
+        v_scale_buffer = v_buffer
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         sm_scale,
         kv_indptr,
         kv_indices,
@@ -491,11 +596,17 @@ def _decode_grouped_att_m_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
+        k_scale_buffer.stride(0) if use_int8_kv else 0,
+        k_scale_buffer.stride(1) if use_int8_kv else 0,
+        v_scale_buffer.stride(0) if use_int8_kv else 0,
+        v_scale_buffer.stride(1) if use_int8_kv else 0,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
         kv_group_num=kv_group_num,
         q_head_num=head_num,
+        KV_GROUP_SIZE=kv_group_size,
+        USE_INT8_KV=use_int8_kv,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
@@ -645,6 +756,9 @@ def decode_attention_fwd_normal(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    kv_group_size=128,
+    k_scale_buffer=None,
+    v_scale_buffer=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -659,6 +773,9 @@ def decode_attention_fwd_normal(
         sm_scale,
         logit_cap,
         xai_temperature_len,
+        kv_group_size,
+        k_scale_buffer,
+        v_scale_buffer,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -688,6 +805,9 @@ def decode_attention_fwd_grouped(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    kv_group_size=128,
+    k_scale_buffer=None,
+    v_scale_buffer=None,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -702,6 +822,9 @@ def decode_attention_fwd_grouped(
         sm_scale,
         logit_cap,
         xai_temperature_len,
+        kv_group_size,
+        k_scale_buffer,
+        v_scale_buffer,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -731,6 +854,9 @@ def decode_attention_fwd(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    kv_group_size=128,
+    k_scale_buffer=None,
+    v_scale_buffer=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -755,6 +881,9 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
+            kv_group_size=kv_group_size,
+            k_scale_buffer=k_scale_buffer,
+            v_scale_buffer=v_scale_buffer,
         )
     else:
         # GQA/MQA/MLA
@@ -773,4 +902,7 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
+            kv_group_size=kv_group_size,
+            k_scale_buffer=k_scale_buffer,
+            v_scale_buffer=v_scale_buffer,
         )

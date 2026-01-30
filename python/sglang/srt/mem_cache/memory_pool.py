@@ -45,6 +45,9 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.srt.layers.quantization.kvi8_tensor import (
+    quantize_kv_int8,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -676,6 +679,16 @@ class KVCache(abc.ABC):
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
 
+    # Optional scale buffers for quantized KV cache.
+    def get_key_scale_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        return None
+
+    def get_value_scale_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        return None
+
+    def get_kv_group_size(self) -> Optional[int]:
+        return None
+
 
 class MHATokenToKVPool(KVCache):
 
@@ -1018,6 +1031,205 @@ class MHATokenToKVPool(KVCache):
                 num_warps=cfg["num_warps"],
                 num_stages=2,
             )
+
+
+class MHATokenToKVPoolINT8(MHATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        v_head_dim: Optional[int] = None,
+        swa_head_num: Optional[int] = None,
+        swa_head_dim: Optional[int] = None,
+        swa_v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+        kv_group_size: int = 128,
+    ):
+        self.kv_group_size = kv_group_size
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            head_num,
+            head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+        )
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = self.head_num
+                k = self.head_dim
+                v = self.v_head_dim
+
+                if k % self.kv_group_size != 0 or v % self.kv_group_size != 0:
+                    raise ValueError(
+                        f"int8 KV cache requires head_dim and v_head_dim to be multiples "
+                        f"of kv_group_size={self.kv_group_size}. Got head_dim={k}, v_head_dim={v}."
+                    )
+
+                self.store_dtype = torch.int8
+                self.k_buffer = [
+                    torch.zeros(
+                        (m, n, k),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (m, n, v),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                k_groups = k // self.kv_group_size
+                v_groups = v // self.kv_group_size
+                self.k_scale_buffer = [
+                    torch.ones(
+                        (m, n, k_groups),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.ones(
+                        (m, n, v_groups),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.k_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat(
+            [
+                self.k_data_ptrs,
+                self.v_data_ptrs,
+                self.k_scale_data_ptrs,
+                self.v_scale_data_ptrs,
+            ],
+            dim=0,
+        )
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in (
+                    self.k_buffer
+                    + self.v_buffer
+                    + self.k_scale_buffer
+                    + self.v_scale_buffer
+                )
+            ],
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        k_size_bytes = (
+            get_tensor_size_bytes(self.k_buffer)
+            + get_tensor_size_bytes(self.k_scale_buffer)
+        )
+        v_size_bytes = (
+            get_tensor_size_bytes(self.v_buffer)
+            + get_tensor_size_bytes(self.v_scale_buffer)
+        )
+        return k_size_bytes, v_size_bytes
+
+    def get_key_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.k_scale_buffer[layer_id - self.start_layer]
+
+    def get_value_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.v_scale_buffer[layer_id - self.start_layer]
+
+    def get_kv_group_size(self) -> int:
+        return self.kv_group_size
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if k_scale is not None:
+            cache_k = cache_k / k_scale
+        if v_scale is not None:
+            cache_v = cache_v / v_scale
+
+        cache_k_q, cache_k_sf = quantize_kv_int8(
+            cache_k, group_size=self.kv_group_size
+        )
+        cache_v_q, cache_v_sf = quantize_kv_int8(
+            cache_v, group_size=self.kv_group_size
+        )
+
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k_q
+        self.v_buffer[layer_id - self.start_layer][loc] = cache_v_q
+        self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_sf
+        self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_sf
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):

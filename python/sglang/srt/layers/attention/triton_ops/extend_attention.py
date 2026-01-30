@@ -216,6 +216,8 @@ def _fwd_kernel(
     O_Extend,
     K_Buffer,
     V_Buffer,
+    K_Scale_Buffer,
+    V_Scale_Buffer,
     qo_indptr,
     kv_indptr,
     kv_indices,
@@ -237,6 +239,10 @@ def _fwd_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_ks,
+    stride_buf_ksh,
+    stride_buf_vs,
+    stride_buf_vsh,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -252,6 +258,8 @@ def _fwd_kernel(
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    USE_INT8_KV: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -364,6 +372,32 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
+            if USE_INT8_KV:
+                offs_g = offs_d // KV_GROUP_SIZE
+                offs_buf_ks = (
+                    offs_kv_loc[None, :] * stride_buf_ks
+                    + cur_kv_head * stride_buf_ksh
+                    + offs_g[:, None]
+                )
+                k_scale = tl.load(
+                    K_Scale_Buffer + offs_buf_ks,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=1.0,
+                )
+                k = k.to(tl.float16) * k_scale
+            if USE_INT8_KV:
+                offs_g = offs_d // KV_GROUP_SIZE
+                offs_buf_ks = (
+                    offs_kv_loc[None, :] * stride_buf_ks
+                    + cur_kv_head * stride_buf_ksh
+                    + offs_g[:, None]
+                )
+                k_scale = tl.load(
+                    K_Scale_Buffer + offs_buf_ks,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=1.0,
+                )
+                k = k.to(tl.float16) * k_scale
 
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
@@ -377,6 +411,32 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
+                if USE_INT8_KV:
+                    offs_gpe = offs_dpe // KV_GROUP_SIZE
+                    offs_buf_kpe_s = (
+                        offs_kv_loc[None, :] * stride_buf_ks
+                        + cur_kv_head * stride_buf_ksh
+                        + offs_gpe[:, None]
+                    )
+                    kpe_scale = tl.load(
+                        K_Scale_Buffer + offs_buf_kpe_s,
+                        mask=mask_n[None, :],
+                        other=1.0,
+                    )
+                    kpe = kpe.to(tl.float16) * kpe_scale
+                if USE_INT8_KV:
+                    offs_gpe = offs_dpe // KV_GROUP_SIZE
+                    offs_buf_kpe_s = (
+                        offs_kv_loc[None, :] * stride_buf_ks
+                        + cur_kv_head * stride_buf_ksh
+                        + offs_gpe[:, None]
+                    )
+                    kpe_scale = tl.load(
+                        K_Scale_Buffer + offs_buf_kpe_s,
+                        mask=mask_n[None, :],
+                        other=1.0,
+                    )
+                    kpe = kpe.to(tl.float16) * kpe_scale
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
             qk *= sm_scale
 
@@ -406,6 +466,32 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
+            if USE_INT8_KV:
+                offs_gv = offs_dv // KV_GROUP_SIZE
+                offs_buf_vs = (
+                    offs_kv_loc[:, None] * stride_buf_vs
+                    + cur_kv_head * stride_buf_vsh
+                    + offs_gv[None, :]
+                )
+                v_scale = tl.load(
+                    V_Scale_Buffer + offs_buf_vs,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=1.0,
+                )
+                v = v.to(tl.float16) * v_scale
+            if USE_INT8_KV:
+                offs_gv = offs_dv // KV_GROUP_SIZE
+                offs_buf_vs = (
+                    offs_kv_loc[:, None] * stride_buf_vs
+                    + cur_kv_head * stride_buf_vsh
+                    + offs_gv[None, :]
+                )
+                v_scale = tl.load(
+                    V_Scale_Buffer + offs_buf_vs,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=1.0,
+                )
+                v = v.to(tl.float16) * v_scale
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -560,6 +646,9 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    kv_group_size=128,
+    k_scale_buffer=None,
+    v_scale_buffer=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -594,6 +683,10 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    use_int8_kv = k_scale_buffer is not None and v_scale_buffer is not None
+    if not use_int8_kv:
+        k_scale_buffer = k_buffer
+        v_scale_buffer = v_buffer
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -601,6 +694,8 @@ def extend_attention_fwd(
         o_extend,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -622,6 +717,10 @@ def extend_attention_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
+        k_scale_buffer.stride(0) if use_int8_kv else 0,
+        k_scale_buffer.stride(1) if use_int8_kv else 0,
+        v_scale_buffer.stride(0) if use_int8_kv else 0,
+        v_scale_buffer.stride(1) if use_int8_kv else 0,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
@@ -637,6 +736,8 @@ def extend_attention_fwd(
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
+        KV_GROUP_SIZE=kv_group_size,
+        USE_INT8_KV=use_int8_kv,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
@@ -686,6 +787,8 @@ def _fwd_kernel_unified(
     O,
     K_Buffer,
     V_Buffer,
+    K_Scale_Buffer,
+    V_Scale_Buffer,
     qo_indptr,
     kv_indptr,
     kv_indices,
@@ -704,6 +807,10 @@ def _fwd_kernel_unified(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_ks,
+    stride_buf_ksh,
+    stride_buf_vs,
+    stride_buf_vsh,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -717,6 +824,8 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    KV_GROUP_SIZE: tl.constexpr,
+    USE_INT8_KV: tl.constexpr,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
@@ -951,6 +1060,9 @@ def extend_attention_fwd_unified(
     sinks=None,
     window_start_pos=None,
     xai_temperature_len=-1,
+    kv_group_size=128,
+    k_scale_buffer=None,
+    v_scale_buffer=None,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1003,11 +1115,17 @@ def extend_attention_fwd_unified(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    use_int8_kv = k_scale_buffer is not None and v_scale_buffer is not None
+    if not use_int8_kv:
+        k_scale_buffer = k_buffer
+        v_scale_buffer = v_buffer
     _fwd_kernel_unified[grid](
         q,
         o,
         k_buffer,
         v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -1026,6 +1144,10 @@ def extend_attention_fwd_unified(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
+        k_scale_buffer.stride(0) if use_int8_kv else 0,
+        k_scale_buffer.stride(1) if use_int8_kv else 0,
+        v_scale_buffer.stride(0) if use_int8_kv else 0,
+        v_scale_buffer.stride(1) if use_int8_kv else 0,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
@@ -1039,6 +1161,8 @@ def extend_attention_fwd_unified(
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
+        KV_GROUP_SIZE=kv_group_size,
+        USE_INT8_KV=use_int8_kv,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

@@ -1845,6 +1845,20 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
+        if self.kv_cache_dtype == "int8":
+            if self.prefill_attention_backend is not None or self.decode_attention_backend is not None:
+                raise ValueError(
+                    "int8 KV cache is only supported with the triton attention backend. "
+                    "Do not set prefill/decode backends when using int8."
+                )
+            if self.attention_backend is None or self.attention_backend == "aiter":
+                logger.info("int8 KV cache requires triton; setting attention backend to triton.")
+                self.attention_backend = "triton"
+            elif self.attention_backend != "triton":
+                raise ValueError(
+                    f"int8 KV cache is only supported with the triton attention backend; got {self.attention_backend}."
+                )
+
         if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
                 f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
@@ -2886,8 +2900,16 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "fp4_e2m1",
+                "int8",
+            ],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "int8" is experimental and currently supported only by the triton backend.',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

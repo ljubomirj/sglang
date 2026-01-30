@@ -834,6 +834,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
+        k_scale = forward_batch.token_to_kv_pool.get_key_scale_buffer(layer.layer_id)
+        v_scale = forward_batch.token_to_kv_pool.get_value_scale_buffer(layer.layer_id)
+        kv_group_size = forward_batch.token_to_kv_pool.get_kv_group_size() or 128
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -855,6 +858,9 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
+            kv_group_size=kv_group_size,
+            k_scale_buffer=k_scale,
+            v_scale_buffer=v_scale,
         )
         return o
 
@@ -975,6 +981,9 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_start_pos=window_start_pos,
             xai_temperature_len=layer.xai_temperature_len,
+            kv_group_size=forward_batch.token_to_kv_pool.get_kv_group_size() or 128,
+            k_scale_buffer=forward_batch.token_to_kv_pool.get_key_scale_buffer(layer.layer_id),
+            v_scale_buffer=forward_batch.token_to_kv_pool.get_value_scale_buffer(layer.layer_id),
         )
 
         return o
@@ -1012,6 +1021,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+        k_scale = forward_batch.token_to_kv_pool.get_key_scale_buffer(layer.layer_id)
+        v_scale = forward_batch.token_to_kv_pool.get_value_scale_buffer(layer.layer_id)
+        kv_group_size = forward_batch.token_to_kv_pool.get_kv_group_size() or 128
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1028,6 +1040,9 @@ class TritonAttnBackend(AttentionBackend):
             logit_cap=logits_soft_cap,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
+            kv_group_size=kv_group_size,
+            k_scale_buffer=k_scale,
+            v_scale_buffer=v_scale,
         )
         return o
 
