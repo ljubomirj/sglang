@@ -723,6 +723,7 @@ def main(args: argparse.Namespace):
         use_int8_w8a8,
         use_int8_w8a16,
         False,
+        False,
         block_shape,
     )
     print(

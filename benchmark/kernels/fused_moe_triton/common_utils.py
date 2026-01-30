@@ -39,12 +39,17 @@ def get_model_config(
     config = get_config(model_name, trust_remote_code=True)
 
     block_shape = None
-    if (
-        hasattr(config, "quantization_config")
-        and "weight_block_size" in config.quantization_config
-    ):
-        block_shape = config.quantization_config["weight_block_size"]
-        assert len(block_shape) == 2
+    if hasattr(config, "quantization_config"):
+        quant_cfg = config.quantization_config
+        if isinstance(quant_cfg, dict) and "weight_block_size" in quant_cfg:
+            block_shape = quant_cfg["weight_block_size"]
+            assert len(block_shape) == 2
+        elif isinstance(quant_cfg, dict):
+            group_size = quant_cfg.get("group_size")
+            bits = quant_cfg.get("bits")
+            if block_shape is None and bits == 4 and group_size:
+                # AWQ/GPTQ int4 uses group size along K.
+                block_shape = [0, int(group_size)]
 
     architecture = config.architectures[0]
 
@@ -74,6 +79,7 @@ def get_model_config(
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
         "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (
@@ -222,21 +228,27 @@ def get_config_filename(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: List[int],
 ) -> str:
     dtype_str = get_config_dtype_str(
         dtype,
         use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
+    if use_int4_w4a16:
+        n_dim = shard_intermediate_size // 4
+    else:
+        n_dim = shard_intermediate_size // 2
     filename = get_config_file_name(
         num_experts,
-        shard_intermediate_size // 2,
+        n_dim,
         dtype_str,
         block_shape,
         per_channel_quant,
