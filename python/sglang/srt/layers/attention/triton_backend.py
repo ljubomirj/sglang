@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -17,6 +18,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_hip,
     next_power_of_2,
 )
 
@@ -109,6 +111,9 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self._use_int8_kv_hip = get_bool_env_var("SGLANG_INT8_KV_HIP") and is_hip()
+        self._int8_kv_hip_logged = False
+        self._int8_kv_hip_debugged = False
 
         # Decide whether enable deterministic inference with batch-invariant operations
         self.enable_deterministic = (
@@ -1025,6 +1030,21 @@ class TritonAttnBackend(AttentionBackend):
         v_scale = forward_batch.token_to_kv_pool.get_value_scale_buffer(layer.layer_id)
         kv_group_size = forward_batch.token_to_kv_pool.get_kv_group_size() or 128
 
+        if self._try_decode_int8_kv_hip(
+            q,
+            o,
+            layer,
+            forward_batch,
+            kv_indptr,
+            kv_indices,
+            k_scale,
+            v_scale,
+            kv_group_size,
+            logits_soft_cap,
+            sinks,
+        ):
+            return o
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1045,6 +1065,90 @@ class TritonAttnBackend(AttentionBackend):
             v_scale_buffer=v_scale,
         )
         return o
+
+    def _try_decode_int8_kv_hip(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
+        kv_group_size: int,
+        logit_cap: float,
+        sinks: Optional[torch.Tensor],
+    ) -> bool:
+        debug = get_bool_env_var("SGLANG_INT8_KV_HIP_DEBUG")
+        if debug and not self._int8_kv_hip_debugged:
+            kv_head_num = forward_batch.token_to_kv_pool.get_key_buffer(
+                layer.layer_id
+            ).shape[1]
+            logging.getLogger(__name__).warning(
+                "int8_kv_hip check: use=%s, k_scale=%s, v_scale=%s, kv_group_size=%s, "
+                "qk_head_dim=%s, v_head_dim=%s, tp_q_head=%s, tp_k_head=%s, kv_head_num=%s, sinks=%s, xai_len=%s",
+                self._use_int8_kv_hip,
+                k_scale is not None,
+                v_scale is not None,
+                kv_group_size,
+                layer.qk_head_dim,
+                layer.v_head_dim,
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                kv_head_num,
+                sinks is not None,
+                layer.xai_temperature_len,
+            )
+            self._int8_kv_hip_debugged = True
+        if not self._use_int8_kv_hip:
+            return False
+        if k_scale is None or v_scale is None:
+            return False
+        if layer.qk_head_dim % kv_group_size != 0 or layer.v_head_dim % kv_group_size != 0:
+            return False
+        if layer.tp_q_head_num % layer.tp_k_head_num != 0:
+            return False
+        if sinks is not None:
+            return False
+        if layer.xai_temperature_len > 0:
+            return False
+        if q.dtype != torch.float16:
+            return False
+
+        try:
+            torch.ops.sgl_kernel.decode_attention_int8_kv(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                k_scale,
+                v_scale,
+                kv_indptr,
+                kv_indices,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                layer.scaling,
+                logit_cap,
+                kv_group_size,
+            )
+            if not self._int8_kv_hip_logged:
+                logging.getLogger(__name__).info(
+                    "Using custom HIP int8 KV decode kernel"
+                )
+                if get_bool_env_var("SGLANG_INT8_KV_HIP_DEBUG"):
+                    print("[SGLANG] Using custom HIP int8 KV decode kernel")
+                self._int8_kv_hip_logged = True
+            if not self._int8_kv_hip_logged:
+                logging.getLogger(__name__).info(
+                    "Using custom HIP int8 KV decode kernel"
+                )
+                self._int8_kv_hip_logged = True
+            return True
+        except Exception as e:
+            if get_bool_env_var("SGLANG_INT8_KV_HIP_DEBUG"):
+                logging.getLogger(__name__).warning(
+                    "Custom HIP int8 KV decode kernel failed: %s", e
+                )
+            return False
 
 
 class TritonMultiStepDraftBackend:

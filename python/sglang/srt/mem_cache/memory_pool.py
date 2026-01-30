@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -1788,6 +1789,143 @@ class MLATokenToKVPool(KVCache):
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
+
+
+class MLATokenToKVPoolINT8(MLATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        kv_group_size: int = 128,
+    ):
+        self.kv_group_size = kv_group_size
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = 1
+                k = self.kv_cache_dim
+
+                if k % self.kv_group_size != 0 or self.kv_lora_rank % self.kv_group_size != 0:
+                    gcd = math.gcd(k, self.kv_lora_rank)
+                    if gcd <= 0:
+                        raise ValueError(
+                            f"int8 KV cache requires head dims to be divisible by group size; "
+                            f"got kv_cache_dim={k}, kv_lora_rank={self.kv_lora_rank}, "
+                            f"kv_group_size={self.kv_group_size}"
+                        )
+                    self.kv_group_size = 1 << (gcd.bit_length() - 1)
+                    if k % self.kv_group_size != 0 or self.kv_lora_rank % self.kv_group_size != 0:
+                        raise ValueError(
+                            f"int8 KV cache requires head dims to be divisible by group size; "
+                            f"got kv_cache_dim={k}, kv_lora_rank={self.kv_lora_rank}, "
+                            f"kv_group_size={self.kv_group_size}"
+                        )
+
+                k_groups = k // self.kv_group_size
+                self.kv_buffer = [
+                    torch.zeros(
+                        (m, n, k),
+                        dtype=torch.int8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.kv_scale_buffer = [
+                    torch.ones(
+                        (m, n, k_groups),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+        del self.kv_scale_buffer
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = get_tensor_size_bytes(self.kv_buffer)
+        kv_size_bytes += get_tensor_size_bytes(self.kv_scale_buffer)
+        return kv_size_bytes
+
+    def get_key_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.kv_scale_buffer[layer_id - self.start_layer]
+
+    def get_value_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.kv_scale_buffer[layer_id - self.start_layer]
+
+    def get_kv_group_size(self) -> int:
+        return self.kv_group_size
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            cache_k_q, cache_k_sf = quantize_kv_int8(
+                cache_k, group_size=self.kv_group_size
+            )
+        else:
+            cache_k_q = cache_k
+            cache_k_sf = torch.ones(
+                (cache_k.shape[0], cache_k.shape[1], cache_k.shape[2] // self.kv_group_size),
+                dtype=torch.float16,
+                device=cache_k.device,
+            )
+
+        self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_q
+        self.kv_scale_buffer[layer_id - self.start_layer][loc] = cache_k_sf
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+        cache_k_q, cache_k_sf = quantize_kv_int8(
+            cache_k, group_size=self.kv_group_size
+        )
+        self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_q
+        self.kv_scale_buffer[layer_id - self.start_layer][loc] = cache_k_sf
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):

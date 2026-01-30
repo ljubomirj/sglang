@@ -132,18 +132,30 @@ def _fwd_kernel_stage1(
                 other=0.0,
             )
             if USE_INT8_KV:
-                offs_g = offs_d // KV_GROUP_SIZE
-                offs_buf_ks = (
-                    kv_loc[:, None] * stride_buf_ks
-                    + cur_kv_head * stride_buf_ksh
-                    + offs_g[None, :]
-                )
-                k_scale = tl.load(
-                    K_Scale_Buffer + offs_buf_ks,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
-                    other=1.0,
-                )
-                k = k.to(tl.float16) * k_scale
+                if KV_GROUP_SIZE >= Lk:
+                    offs_buf_ks = (
+                        kv_loc[:, None] * stride_buf_ks
+                        + cur_kv_head * stride_buf_ksh
+                    )
+                    k_scale = tl.load(
+                        K_Scale_Buffer + offs_buf_ks,
+                        mask=(offs_n[:, None] < split_kv_end),
+                        other=1.0,
+                    )
+                    k = k.to(tl.float16) * k_scale
+                else:
+                    offs_g = offs_d // KV_GROUP_SIZE
+                    offs_buf_ks = (
+                        kv_loc[:, None] * stride_buf_ks
+                        + cur_kv_head * stride_buf_ksh
+                        + offs_g[None, :]
+                    )
+                    k_scale = tl.load(
+                        K_Scale_Buffer + offs_buf_ks,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                        other=1.0,
+                    )
+                    k = k.to(tl.float16) * k_scale
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
 
@@ -166,18 +178,30 @@ def _fwd_kernel_stage1(
                 other=0.0,
             )
             if USE_INT8_KV:
-                offs_gv = offs_dv // KV_GROUP_SIZE
-                offs_buf_vs = (
-                    kv_loc[:, None] * stride_buf_vs
-                    + cur_kv_head * stride_buf_vsh
-                    + offs_gv[None, :]
-                )
-                v_scale = tl.load(
-                    V_Scale_Buffer + offs_buf_vs,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                    other=1.0,
-                )
-                v = v.to(tl.float16) * v_scale
+                if KV_GROUP_SIZE >= Lv:
+                    offs_buf_vs = (
+                        kv_loc[:, None] * stride_buf_vs
+                        + cur_kv_head * stride_buf_vsh
+                    )
+                    v_scale = tl.load(
+                        V_Scale_Buffer + offs_buf_vs,
+                        mask=(offs_n[:, None] < split_kv_end),
+                        other=1.0,
+                    )
+                    v = v.to(tl.float16) * v_scale
+                else:
+                    offs_gv = offs_dv // KV_GROUP_SIZE
+                    offs_buf_vs = (
+                        kv_loc[:, None] * stride_buf_vs
+                        + cur_kv_head * stride_buf_vsh
+                        + offs_gv[None, :]
+                    )
+                    v_scale = tl.load(
+                        V_Scale_Buffer + offs_buf_vs,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=1.0,
+                    )
+                    v = v.to(tl.float16) * v_scale
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -410,18 +434,30 @@ def _fwd_grouped_kernel_stage1(
                 other=0.0,
             )
             if USE_INT8_KV:
-                offs_g = offs_d // KV_GROUP_SIZE
-                offs_buf_ks = (
-                    kv_loc[None, :] * stride_buf_ks
-                    + cur_kv_head * stride_buf_ksh
-                    + offs_g[:, None]
-                )
-                k_scale = tl.load(
-                    K_Scale_Buffer + offs_buf_ks,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                    other=1.0,
-                )
-                k = k.to(tl.float16) * k_scale
+                if KV_GROUP_SIZE >= Lk:
+                    offs_buf_ks = (
+                        kv_loc[None, :] * stride_buf_ks
+                        + cur_kv_head * stride_buf_ksh
+                    )
+                    k_scale = tl.load(
+                        K_Scale_Buffer + offs_buf_ks,
+                        mask=(offs_n[None, :] < split_kv_end),
+                        other=1.0,
+                    )
+                    k = k.to(tl.float16) * k_scale
+                else:
+                    offs_g = offs_d // KV_GROUP_SIZE
+                    offs_buf_ks = (
+                        kv_loc[None, :] * stride_buf_ks
+                        + cur_kv_head * stride_buf_ksh
+                        + offs_g[:, None]
+                    )
+                    k_scale = tl.load(
+                        K_Scale_Buffer + offs_buf_ks,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                        other=1.0,
+                    )
+                    k = k.to(tl.float16) * k_scale
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
@@ -471,18 +507,30 @@ def _fwd_grouped_kernel_stage1(
                 other=0.0,
             )
             if USE_INT8_KV:
-                offs_gv = offs_dv // KV_GROUP_SIZE
-                offs_buf_vs = (
-                    kv_loc[:, None] * stride_buf_vs
-                    + cur_kv_head * stride_buf_vsh
-                    + offs_gv[None, :]
-                )
-                v_scale = tl.load(
-                    V_Scale_Buffer + offs_buf_vs,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                    other=1.0,
-                )
-                v = v.to(tl.float16) * v_scale
+                if KV_GROUP_SIZE >= Lv:
+                    offs_buf_vs = (
+                        kv_loc[:, None] * stride_buf_vs
+                        + cur_kv_head * stride_buf_vsh
+                    )
+                    v_scale = tl.load(
+                        V_Scale_Buffer + offs_buf_vs,
+                        mask=(offs_n[:, None] < split_kv_end),
+                        other=1.0,
+                    )
+                    v = v.to(tl.float16) * v_scale
+                else:
+                    offs_gv = offs_dv // KV_GROUP_SIZE
+                    offs_buf_vs = (
+                        kv_loc[:, None] * stride_buf_vs
+                        + cur_kv_head * stride_buf_vsh
+                        + offs_gv[None, :]
+                    )
+                    v_scale = tl.load(
+                        V_Scale_Buffer + offs_buf_vs,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=1.0,
+                    )
+                    v = v.to(tl.float16) * v_scale
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)

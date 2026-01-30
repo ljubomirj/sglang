@@ -55,6 +55,7 @@ sources = [
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
+    "csrc/attention/int8_kv_decode.cu",
 ]
 
 cxx_flags = ["-O3"]

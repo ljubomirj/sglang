@@ -469,6 +469,21 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+            elif self.kv_cache_dtype == torch.int8:
+                from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolINT8
+
+                self.token_to_kv_pool = MLATokenToKVPoolINT8(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(
                     self.max_total_num_tokens,

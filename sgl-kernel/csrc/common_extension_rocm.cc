@@ -225,6 +225,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
+
+  /*
+   * From csrc/attention
+   */
+  m.def(
+      "decode_attention_int8_kv(Tensor q, Tensor k_cache, Tensor v_cache, Tensor k_scale, Tensor v_scale, "
+      "Tensor kv_indptr, Tensor kv_indices, Tensor! output, float sm_scale, float logit_cap, int kv_group_size) -> ()");
+  m.impl("decode_attention_int8_kv", torch::kCUDA, &decode_attention_int8_kv);
 }
 
 REGISTER_EXTENSION(common_ops)
