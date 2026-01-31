@@ -31,6 +31,14 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
   return val;
 }
 
+__device__ __forceinline__ float warp_broadcast(float val, int src_lane = 0) {
+#if defined(__HIPCC__)
+  return __shfl(val, src_lane, kWarpSize);
+#else
+  return __shfl_sync(0xffffffff, val, src_lane);
+#endif
+}
+
 __device__ __forceinline__ float warp_reduce_max(float val) {
 #if defined(__HIPCC__)
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -152,7 +160,8 @@ __global__ void decode_int8_kv_kernel(
         int8_t k_val = k_cache[token_idx * stride_kbs + kv_head * stride_kh + d];
         partial += q_shared[d] * (static_cast<float>(k_val) * scale);
       }
-      qk = warp_reduce_sum(partial) * sm_scale;
+      qk = warp_reduce_sum(partial);
+      qk = warp_broadcast(qk, 0) * sm_scale;
       if (logit_cap > 0.0f) {
         qk = logit_cap * tanhf(qk / logit_cap);
       }

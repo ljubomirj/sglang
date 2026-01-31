@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -34,6 +35,16 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         return logit_cap
     else:
         raise ValueError()
+
+
+def _get_float_env_var(name: str, default: float) -> float:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -1024,7 +1035,10 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).dtype
             == torch.int8
         )
-        o_dtype = torch.float16 if use_int8_kv_hip else q.dtype
+        if use_int8_kv_hip and q.dtype == torch.float32:
+            o_dtype = torch.float32
+        else:
+            o_dtype = torch.float16 if use_int8_kv_hip else q.dtype
         if layer.qk_head_dim != layer.v_head_dim:
             o = torch.empty(
                 (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -1196,6 +1210,64 @@ class TritonAttnBackend(AttentionBackend):
                         can_sync = True
                 if can_sync:
                     torch.cuda.synchronize()
+            if get_bool_env_var("SGLANG_INT8_KV_VALIDATE"):
+                can_validate = True
+                if hasattr(torch.cuda, "is_current_stream_capturing"):
+                    try:
+                        can_validate = not torch.cuda.is_current_stream_capturing()
+                    except Exception:
+                        can_validate = True
+                validate_always = get_bool_env_var(
+                    "SGLANG_INT8_KV_VALIDATE_ALWAYS", "false"
+                )
+                if can_validate and (
+                    validate_always
+                    or not getattr(self, "_int8_kv_hip_validated", False)
+                ):
+                    o_ref = torch.empty_like(o_kernel)
+                    prev_use = self._use_int8_kv_hip
+                    self._use_int8_kv_hip = False
+                    try:
+                        self.decode_attention_fwd(
+                            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                            forward_batch.token_to_kv_pool.get_key_buffer(
+                                layer.layer_id
+                            ),
+                            forward_batch.token_to_kv_pool.get_value_buffer(
+                                layer.layer_id
+                            ),
+                            o_ref.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            kv_indptr,
+                            kv_indices,
+                            self.forward_metadata.attn_logits,
+                            self.forward_metadata.attn_lse,
+                            self.forward_metadata.num_kv_splits,
+                            self.max_kv_splits,
+                            layer.scaling,
+                            logit_cap=logit_cap,
+                            sinks=sinks,
+                            xai_temperature_len=layer.xai_temperature_len,
+                            kv_group_size=kv_group_size,
+                            k_scale_buffer=k_scale,
+                            v_scale_buffer=v_scale,
+                        )
+                    finally:
+                        self._use_int8_kv_hip = prev_use
+                    diff = (o_ref - o_kernel).abs().max().item()
+                    eps = _get_float_env_var("SGLANG_INT8_KV_VALIDATE_EPS", 1e-2)
+                    if diff > eps:
+                        logging.getLogger(__name__).error(
+                            "int8_kv_hip validation failed: max_abs_diff=%.6f > %.6f",
+                            diff,
+                            eps,
+                        )
+                        if get_bool_env_var(
+                            "SGLANG_INT8_KV_VALIDATE_DISABLE_ON_FAIL", "true"
+                        ):
+                            self._use_int8_kv_hip = False
+                            return False
+                    if not validate_always:
+                        self._int8_kv_hip_validated = True
             if not self._int8_kv_hip_logged:
                 logging.getLogger(__name__).info(
                     "Using custom HIP int8 KV decode kernel"
