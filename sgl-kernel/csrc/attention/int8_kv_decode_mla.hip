@@ -199,6 +199,7 @@ __global__ void decode_int8_kv_mla_kernel(
   bool vec_v = (kv_group_size % 4 == 0) && (v_head_dim % 4 == 0);
   bool kv_group64 = kv_group_size == 64;
   bool kv_group128 = kv_group_size == 128;
+  bool use_group128 = kv_group128 && (qk_head_dim == 256) && (v_head_dim == 256);
 
   int v_per_thread = (v_head_dim + blockDim.x - 1) / blockDim.x;
   for (int i = 0; i < v_per_thread; ++i) {
@@ -238,19 +239,32 @@ __global__ void decode_int8_kv_mla_kernel(
 
       float qk = -INFINITY;
       if (token_valid) {
+        float scale0_k = 0.0f;
+        float scale1_k = 0.0f;
+        if (use_group128) {
+          scale0_k = __half2float(
+              k_scale[token_idx * stride_ks + kv_head * stride_ksh + 0]);
+          scale1_k = __half2float(
+              k_scale[token_idx * stride_ks + kv_head * stride_ksh + 1]);
+        }
         float partial = 0.0f;
         if (vec_k) {
           for (int d = lane * 4; d < qk_head_dim; d += kWarpSize * 4) {
-            int scale_idx;
-            if (kv_group64) {
-              scale_idx = d >> 6;
-            } else if (kv_group128) {
-              scale_idx = d >> 7;
+            float scale;
+            if (use_group128) {
+              scale = (d < 128) ? scale0_k : scale1_k;
             } else {
-              scale_idx = d / kv_group_size;
+              int scale_idx;
+              if (kv_group64) {
+                scale_idx = d >> 6;
+              } else if (kv_group128) {
+                scale_idx = d >> 7;
+              } else {
+                scale_idx = d / kv_group_size;
+              }
+              scale = __half2float(
+                  k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
             }
-            float scale = __half2float(
-                k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
             const int8_t* k_ptr =
                 k_cache + token_idx * stride_kbs + kv_head * stride_kh + d;
             int32_t packed = *reinterpret_cast<const int32_t*>(k_ptr);
@@ -277,16 +291,21 @@ __global__ void decode_int8_kv_mla_kernel(
           }
         } else {
           for (int d = lane; d < qk_head_dim; d += kWarpSize) {
-            int scale_idx;
-            if (kv_group64) {
-              scale_idx = d >> 6;
-            } else if (kv_group128) {
-              scale_idx = d >> 7;
+            float scale;
+            if (use_group128) {
+              scale = (d < 128) ? scale0_k : scale1_k;
             } else {
-              scale_idx = d / kv_group_size;
+              int scale_idx;
+              if (kv_group64) {
+                scale_idx = d >> 6;
+              } else if (kv_group128) {
+                scale_idx = d >> 7;
+              } else {
+                scale_idx = d / kv_group_size;
+              }
+              scale = __half2float(
+                  k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
             }
-            float scale = __half2float(
-                k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
             int8_t k_val =
                 k_cache[token_idx * stride_kbs + kv_head * stride_kh + d];
             partial += q_shared[d] * (static_cast<float>(k_val) * scale);
@@ -361,21 +380,34 @@ __global__ void decode_int8_kv_mla_kernel(
           continue;
         }
         if (vec_v) {
+          float scale0_v = 0.0f;
+          float scale1_v = 0.0f;
+          if (use_group128) {
+            scale0_v = __half2float(
+                v_scale[token_idx * stride_vs + kv_head * stride_vsh + 0]);
+            scale1_v = __half2float(
+                v_scale[token_idx * stride_vs + kv_head * stride_vsh + 1]);
+          }
           int v_vecs_total = v_head_dim / 4;
           int acc_idx = 0;
           for (int vec_idx = threadIdx.x; vec_idx < v_vecs_total;
                vec_idx += blockDim.x, ++acc_idx) {
             int d = vec_idx * 4;
-            int scale_idx;
-            if (kv_group64) {
-              scale_idx = d >> 6;
-            } else if (kv_group128) {
-              scale_idx = d >> 7;
+            float scale;
+            if (use_group128) {
+              scale = (d < 128) ? scale0_v : scale1_v;
             } else {
-              scale_idx = d / kv_group_size;
+              int scale_idx;
+              if (kv_group64) {
+                scale_idx = d >> 6;
+              } else if (kv_group128) {
+                scale_idx = d >> 7;
+              } else {
+                scale_idx = d / kv_group_size;
+              }
+              scale = __half2float(
+                  v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
             }
-            float scale = __half2float(
-                v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
             const int8_t* v_ptr =
                 v_cache + token_idx * stride_vbs + kv_head * stride_vh + d;
             int32_t packed = *reinterpret_cast<const int32_t*>(v_ptr);
@@ -390,18 +422,31 @@ __global__ void decode_int8_kv_mla_kernel(
             acc_vec[acc_idx][3] += p_scale * static_cast<float>(v3);
           }
         } else {
+          float scale0_v = 0.0f;
+          float scale1_v = 0.0f;
+          if (use_group128) {
+            scale0_v = __half2float(
+                v_scale[token_idx * stride_vs + kv_head * stride_vsh + 0]);
+            scale1_v = __half2float(
+                v_scale[token_idx * stride_vs + kv_head * stride_vsh + 1]);
+          }
           int acc_idx = 0;
           for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x, ++acc_idx) {
-            int scale_idx;
-            if (kv_group64) {
-              scale_idx = d >> 6;
-            } else if (kv_group128) {
-              scale_idx = d >> 7;
+            float scale;
+            if (use_group128) {
+              scale = (d < 128) ? scale0_v : scale1_v;
             } else {
-              scale_idx = d / kv_group_size;
+              int scale_idx;
+              if (kv_group64) {
+                scale_idx = d >> 6;
+              } else if (kv_group128) {
+                scale_idx = d >> 7;
+              } else {
+                scale_idx = d / kv_group_size;
+              }
+              scale = __half2float(
+                  v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
             }
-            float scale = __half2float(
-                v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
             int8_t v_val =
                 v_cache[token_idx * stride_vbs + kv_head * stride_vh + d];
             acc[acc_idx] += p * (static_cast<float>(v_val) * scale);
