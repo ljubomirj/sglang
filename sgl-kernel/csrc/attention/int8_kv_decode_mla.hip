@@ -16,9 +16,14 @@
 namespace {
 
 constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = 2;
+constexpr int kBlockThreads = kWarpSize * kWarpsPerBlock;
 constexpr int kMaxVHeadDim = 1024;
-constexpr int kMaxVPerLane = (kMaxVHeadDim + kWarpSize - 1) / kWarpSize;
+constexpr int kMaxVPerThread = (kMaxVHeadDim + kBlockThreads - 1) / kBlockThreads;
+constexpr int kMaxVVecPerThread =
+    ((kMaxVHeadDim / 4) + kBlockThreads - 1) / kBlockThreads;
 constexpr int kBlockN = 16;
+constexpr int kTokensPerWarp = kBlockN / kWarpsPerBlock;
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
 #if defined(__HIPCC__)
@@ -100,18 +105,18 @@ __global__ void decode_int8_kv_mla_kernel(
     return;
   }
 
-  int lane = threadIdx.x;
-  if (lane >= kWarpSize) {
-    return;
-  }
+  int lane = threadIdx.x % kWarpSize;
+  int warp_id = threadIdx.x / kWarpSize;
 
   extern __shared__ char smem[];
   float* q_shared = reinterpret_cast<float*>(smem);
   float* qk_tile = q_shared + qk_head_dim;
   float* p_tile = qk_tile + kBlockN;
-  float acc[kMaxVPerLane];
+  float* ml_shared = p_tile + kBlockN;
+  float acc[kMaxVPerThread];
+  float acc_vec[kMaxVVecPerThread][4];
 
-  for (int d = lane; d < qk_head_dim; d += kWarpSize) {
+  for (int d = threadIdx.x; d < qk_head_dim; d += blockDim.x) {
     q_shared[d] = to_float(q[b * stride_qbs + h * stride_qh + d]);
   }
 
@@ -121,9 +126,22 @@ __global__ void decode_int8_kv_mla_kernel(
     return;
   }
 
-  int v_per_lane = (v_head_dim + kWarpSize - 1) / kWarpSize;
-  for (int i = 0; i < v_per_lane; ++i) {
+  bool vec_k = (kv_group_size % 4 == 0) && (qk_head_dim % 4 == 0);
+  bool vec_v = (kv_group_size % 4 == 0) && (v_head_dim % 4 == 0);
+
+  int v_per_thread = (v_head_dim + blockDim.x - 1) / blockDim.x;
+  for (int i = 0; i < v_per_thread; ++i) {
     acc[i] = 0.0f;
+  }
+  if (vec_v) {
+    int v_vecs_total = v_head_dim / 4;
+    int v_vecs_per_thread = (v_vecs_total + blockDim.x - 1) / blockDim.x;
+    for (int i = 0; i < v_vecs_per_thread; ++i) {
+      acc_vec[i][0] = 0.0f;
+      acc_vec[i][1] = 0.0f;
+      acc_vec[i][2] = 0.0f;
+      acc_vec[i][3] = 0.0f;
+    }
   }
 
   int32_t kv_start = kv_indptr[b];
@@ -138,19 +156,44 @@ __global__ void decode_int8_kv_mla_kernel(
       tile_count = kBlockN;
     }
 
-    for (int t = 0; t < tile_count; ++t) {
+    int t_start = warp_id * kTokensPerWarp;
+    int t_end = t_start + kTokensPerWarp;
+    if (t_end > tile_count) {
+      t_end = tile_count;
+    }
+    for (int t = t_start; t < t_end; ++t) {
       int32_t token_idx = kv_indices[kv_idx + t];
       bool token_valid = token_idx >= 0 && token_idx < max_tokens;
 
       float qk = -INFINITY;
       if (token_valid) {
         float partial = 0.0f;
-        for (int d = lane; d < qk_head_dim; d += kWarpSize) {
-          int scale_idx = d / kv_group_size;
-          float scale = __half2float(
-              k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
-          int8_t k_val = k_cache[token_idx * stride_kbs + kv_head * stride_kh + d];
-          partial += q_shared[d] * (static_cast<float>(k_val) * scale);
+        if (vec_k) {
+          for (int d = lane * 4; d < qk_head_dim; d += kWarpSize * 4) {
+            int scale_idx = d / kv_group_size;
+            float scale = __half2float(
+                k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
+            const int8_t* k_ptr =
+                k_cache + token_idx * stride_kbs + kv_head * stride_kh + d;
+            int32_t packed = *reinterpret_cast<const int32_t*>(k_ptr);
+            int8_t k0 = static_cast<int8_t>(packed & 0xff);
+            int8_t k1 = static_cast<int8_t>((packed >> 8) & 0xff);
+            int8_t k2 = static_cast<int8_t>((packed >> 16) & 0xff);
+            int8_t k3 = static_cast<int8_t>((packed >> 24) & 0xff);
+            partial += q_shared[d] * (static_cast<float>(k0) * scale);
+            partial += q_shared[d + 1] * (static_cast<float>(k1) * scale);
+            partial += q_shared[d + 2] * (static_cast<float>(k2) * scale);
+            partial += q_shared[d + 3] * (static_cast<float>(k3) * scale);
+          }
+        } else {
+          for (int d = lane; d < qk_head_dim; d += kWarpSize) {
+            int scale_idx = d / kv_group_size;
+            float scale = __half2float(
+                k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
+            int8_t k_val =
+                k_cache[token_idx * stride_kbs + kv_head * stride_kh + d];
+            partial += q_shared[d] * (static_cast<float>(k_val) * scale);
+          }
         }
         qk = warp_reduce_sum(partial);
         qk = warp_broadcast(qk, 0) * sm_scale;
@@ -167,7 +210,7 @@ __global__ void decode_int8_kv_mla_kernel(
 
     float m_tile = -INFINITY;
     float l_tile = 0.0f;
-    if (lane == 0) {
+    if (threadIdx.x == 0) {
       for (int t = 0; t < tile_count; ++t) {
         float qk = qk_tile[t];
         if (qk > m_tile) {
@@ -182,19 +225,31 @@ __global__ void decode_int8_kv_mla_kernel(
         sum += p;
       }
       l_tile = sum;
+      ml_shared[0] = m_tile;
+      ml_shared[1] = l_tile;
     }
 
-    m_tile = warp_broadcast(m_tile, 0);
-    l_tile = warp_broadcast(l_tile, 0);
-
     __syncthreads();
+
+    m_tile = ml_shared[0];
+    l_tile = ml_shared[1];
 
     float m_new = fmaxf(m, m_tile);
     float scale_old = (m == -INFINITY) ? 0.0f : expf(m - m_new);
     float scale_tile = (l_tile > 0.0f) ? expf(m_tile - m_new) : 0.0f;
 
-    for (int i = 0; i < v_per_lane; ++i) {
+    for (int i = 0; i < v_per_thread; ++i) {
       acc[i] *= scale_old;
+    }
+    if (vec_v) {
+      int v_vecs_total = v_head_dim / 4;
+      int v_vecs_per_thread = (v_vecs_total + blockDim.x - 1) / blockDim.x;
+      for (int i = 0; i < v_vecs_per_thread; ++i) {
+        acc_vec[i][0] *= scale_old;
+        acc_vec[i][1] *= scale_old;
+        acc_vec[i][2] *= scale_old;
+        acc_vec[i][3] *= scale_old;
+      }
     }
 
     if (scale_tile != 0.0f) {
@@ -208,13 +263,38 @@ __global__ void decode_int8_kv_mla_kernel(
         if (!token_valid) {
           continue;
         }
-        int acc_idx = 0;
-        for (int d = lane; d < v_head_dim; d += kWarpSize, ++acc_idx) {
-          int scale_idx = d / kv_group_size;
-          float scale = __half2float(
-              v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
-          int8_t v_val = v_cache[token_idx * stride_vbs + kv_head * stride_vh + d];
-          acc[acc_idx] += p * (static_cast<float>(v_val) * scale);
+        if (vec_v) {
+          int v_vecs_total = v_head_dim / 4;
+          int acc_idx = 0;
+          for (int vec_idx = threadIdx.x; vec_idx < v_vecs_total;
+               vec_idx += blockDim.x, ++acc_idx) {
+            int d = vec_idx * 4;
+            int scale_idx = d / kv_group_size;
+            float scale = __half2float(
+                v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
+            const int8_t* v_ptr =
+                v_cache + token_idx * stride_vbs + kv_head * stride_vh + d;
+            int32_t packed = *reinterpret_cast<const int32_t*>(v_ptr);
+            int8_t v0 = static_cast<int8_t>(packed & 0xff);
+            int8_t v1 = static_cast<int8_t>((packed >> 8) & 0xff);
+            int8_t v2 = static_cast<int8_t>((packed >> 16) & 0xff);
+            int8_t v3 = static_cast<int8_t>((packed >> 24) & 0xff);
+            float p_scale = p * scale;
+            acc_vec[acc_idx][0] += p_scale * static_cast<float>(v0);
+            acc_vec[acc_idx][1] += p_scale * static_cast<float>(v1);
+            acc_vec[acc_idx][2] += p_scale * static_cast<float>(v2);
+            acc_vec[acc_idx][3] += p_scale * static_cast<float>(v3);
+          }
+        } else {
+          int acc_idx = 0;
+          for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x, ++acc_idx) {
+            int scale_idx = d / kv_group_size;
+            float scale = __half2float(
+                v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
+            int8_t v_val =
+                v_cache[token_idx * stride_vbs + kv_head * stride_vh + d];
+            acc[acc_idx] += p * (static_cast<float>(v_val) * scale);
+          }
         }
       }
     }
@@ -224,13 +304,37 @@ __global__ void decode_int8_kv_mla_kernel(
   }
 
   float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
-  int acc_idx = 0;
-  for (int d = lane; d < v_head_dim; d += kWarpSize, ++acc_idx) {
-    float out_val = acc[acc_idx] * inv_l;
-    if constexpr (std::is_same<Out, half>::value) {
-      out[b * stride_obs + h * stride_oh + d] = __float2half(out_val);
-    } else {
-      out[b * stride_obs + h * stride_oh + d] = out_val;
+  if (vec_v) {
+    int v_vecs_total = v_head_dim / 4;
+    int acc_idx = 0;
+    for (int vec_idx = threadIdx.x; vec_idx < v_vecs_total;
+         vec_idx += blockDim.x, ++acc_idx) {
+      int d = vec_idx * 4;
+      float out0 = acc_vec[acc_idx][0] * inv_l;
+      float out1 = acc_vec[acc_idx][1] * inv_l;
+      float out2 = acc_vec[acc_idx][2] * inv_l;
+      float out3 = acc_vec[acc_idx][3] * inv_l;
+      if constexpr (std::is_same<Out, half>::value) {
+        out[b * stride_obs + h * stride_oh + d] = __float2half(out0);
+        out[b * stride_obs + h * stride_oh + d + 1] = __float2half(out1);
+        out[b * stride_obs + h * stride_oh + d + 2] = __float2half(out2);
+        out[b * stride_obs + h * stride_oh + d + 3] = __float2half(out3);
+      } else {
+        out[b * stride_obs + h * stride_oh + d] = out0;
+        out[b * stride_obs + h * stride_oh + d + 1] = out1;
+        out[b * stride_obs + h * stride_oh + d + 2] = out2;
+        out[b * stride_obs + h * stride_oh + d + 3] = out3;
+      }
+    }
+  } else {
+    int acc_idx = 0;
+    for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x, ++acc_idx) {
+      float out_val = acc[acc_idx] * inv_l;
+      if constexpr (std::is_same<Out, half>::value) {
+        out[b * stride_obs + h * stride_oh + d] = __float2half(out_val);
+      } else {
+        out[b * stride_obs + h * stride_oh + d] = out_val;
+      }
     }
   }
 }
@@ -287,8 +391,9 @@ void decode_attention_int8_kv_mla(
       "v_head_dim exceeds kernel limit");
 
   const dim3 grid(batch_size, head_num, 1);
-  const dim3 block(kWarpSize, 1, 1);
-  size_t shared_bytes = sizeof(float) * (qk_head_dim + 2 * kBlockN);
+  const dim3 block(kBlockThreads, 1, 1);
+  size_t shared_bytes =
+      sizeof(float) * (qk_head_dim + 2 * kBlockN + 2);
 
   const auto stream = at::cuda::getDefaultCUDAStream();
 
