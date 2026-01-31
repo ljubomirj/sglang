@@ -18,6 +18,7 @@ namespace {
 constexpr int kWarpSize = 32;
 constexpr int kMaxVHeadDim = 1024;
 constexpr int kMaxVPerLane = (kMaxVHeadDim + kWarpSize - 1) / kWarpSize;
+constexpr int kBlockN = 16;
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
 #if defined(__HIPCC__)
@@ -106,6 +107,8 @@ __global__ void decode_int8_kv_mla_kernel(
 
   extern __shared__ char smem[];
   float* q_shared = reinterpret_cast<float*>(smem);
+  float* qk_tile = q_shared + qk_head_dim;
+  float* p_tile = qk_tile + kBlockN;
   float acc[kMaxVPerLane];
 
   for (int d = lane; d < qk_head_dim; d += kWarpSize) {
@@ -129,49 +132,95 @@ __global__ void decode_int8_kv_mla_kernel(
   float m = -INFINITY;
   float l = 0.0f;
 
-  for (int32_t kv_idx = kv_start; kv_idx < kv_end; ++kv_idx) {
-    int32_t token_idx = kv_indices[kv_idx];
-    bool token_valid = token_idx >= 0 && token_idx < max_tokens;
+  for (int32_t kv_idx = kv_start; kv_idx < kv_end; kv_idx += kBlockN) {
+    int tile_count = kv_end - kv_idx;
+    if (tile_count > kBlockN) {
+      tile_count = kBlockN;
+    }
 
-    float qk = -INFINITY;
-    if (token_valid) {
-      float partial = 0.0f;
-      for (int d = lane; d < qk_head_dim; d += kWarpSize) {
-        int scale_idx = d / kv_group_size;
-        float scale = __half2float(
-            k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
-        int8_t k_val = k_cache[token_idx * stride_kbs + kv_head * stride_kh + d];
-        partial += q_shared[d] * (static_cast<float>(k_val) * scale);
+    for (int t = 0; t < tile_count; ++t) {
+      int32_t token_idx = kv_indices[kv_idx + t];
+      bool token_valid = token_idx >= 0 && token_idx < max_tokens;
+
+      float qk = -INFINITY;
+      if (token_valid) {
+        float partial = 0.0f;
+        for (int d = lane; d < qk_head_dim; d += kWarpSize) {
+          int scale_idx = d / kv_group_size;
+          float scale = __half2float(
+              k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
+          int8_t k_val = k_cache[token_idx * stride_kbs + kv_head * stride_kh + d];
+          partial += q_shared[d] * (static_cast<float>(k_val) * scale);
+        }
+        qk = warp_reduce_sum(partial);
+        qk = warp_broadcast(qk, 0) * sm_scale;
+        if (logit_cap > 0.0f) {
+          qk = logit_cap * tanhf(qk / logit_cap);
+        }
       }
-      qk = warp_reduce_sum(partial);
-      qk = warp_broadcast(qk, 0) * sm_scale;
-      if (logit_cap > 0.0f) {
-        qk = logit_cap * tanhf(qk / logit_cap);
+      if (lane == 0) {
+        qk_tile[t] = qk;
       }
     }
 
-    float m_new = fmaxf(m, qk);
-    float exp_scale = (m == -INFINITY) ? 0.0f : expf(m - m_new);
-    float p = token_valid ? expf(qk - m_new) : 0.0f;
-    float l_new = l * exp_scale + p;
+    __syncthreads();
+
+    float m_tile = -INFINITY;
+    float l_tile = 0.0f;
+    if (lane == 0) {
+      for (int t = 0; t < tile_count; ++t) {
+        float qk = qk_tile[t];
+        if (qk > m_tile) {
+          m_tile = qk;
+        }
+      }
+      float sum = 0.0f;
+      for (int t = 0; t < tile_count; ++t) {
+        float qk = qk_tile[t];
+        float p = (qk == -INFINITY) ? 0.0f : expf(qk - m_tile);
+        p_tile[t] = p;
+        sum += p;
+      }
+      l_tile = sum;
+    }
+
+    m_tile = warp_broadcast(m_tile, 0);
+    l_tile = warp_broadcast(l_tile, 0);
+
+    __syncthreads();
+
+    float m_new = fmaxf(m, m_tile);
+    float scale_old = (m == -INFINITY) ? 0.0f : expf(m - m_new);
+    float scale_tile = (l_tile > 0.0f) ? expf(m_tile - m_new) : 0.0f;
 
     for (int i = 0; i < v_per_lane; ++i) {
-      acc[i] *= exp_scale;
+      acc[i] *= scale_old;
     }
 
-    if (token_valid && p != 0.0f) {
-      int acc_idx = 0;
-      for (int d = lane; d < v_head_dim; d += kWarpSize, ++acc_idx) {
-        int scale_idx = d / kv_group_size;
-        float scale = __half2float(
-            v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
-        int8_t v_val = v_cache[token_idx * stride_vbs + kv_head * stride_vh + d];
-        acc[acc_idx] += p * (static_cast<float>(v_val) * scale);
+    if (scale_tile != 0.0f) {
+      for (int t = 0; t < tile_count; ++t) {
+        float p = p_tile[t] * scale_tile;
+        if (p == 0.0f) {
+          continue;
+        }
+        int32_t token_idx = kv_indices[kv_idx + t];
+        bool token_valid = token_idx >= 0 && token_idx < max_tokens;
+        if (!token_valid) {
+          continue;
+        }
+        int acc_idx = 0;
+        for (int d = lane; d < v_head_dim; d += kWarpSize, ++acc_idx) {
+          int scale_idx = d / kv_group_size;
+          float scale = __half2float(
+              v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
+          int8_t v_val = v_cache[token_idx * stride_vbs + kv_head * stride_vh + d];
+          acc[acc_idx] += p * (static_cast<float>(v_val) * scale);
+        }
       }
     }
 
     m = m_new;
-    l = l_new;
+    l = l * scale_old + l_tile * scale_tile;
   }
 
   float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
@@ -239,7 +288,7 @@ void decode_attention_int8_kv_mla(
 
   const dim3 grid(batch_size, head_num, 1);
   const dim3 block(kWarpSize, 1, 1);
-  size_t shared_bytes = sizeof(float) * qk_head_dim;
+  size_t shared_bytes = sizeof(float) * (qk_head_dim + 2 * kBlockN);
 
   const auto stream = at::cuda::getDefaultCUDAStream();
 
