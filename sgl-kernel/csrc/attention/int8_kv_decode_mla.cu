@@ -10,19 +10,25 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <cstdlib>
 #include <type_traits>
 
 namespace {
 
 constexpr int kWarpSize = 32;
-constexpr int kWarpsPerBlock = 2;
-constexpr int kBlockThreads = kWarpSize * kWarpsPerBlock;
 constexpr int kMaxVHeadDim = 1024;
-constexpr int kMaxVPerThread = (kMaxVHeadDim + kBlockThreads - 1) / kBlockThreads;
-constexpr int kMaxVVecPerThread =
-    ((kMaxVHeadDim / 4) + kBlockThreads - 1) / kBlockThreads;
 constexpr int kBlockN = 16;
-constexpr int kTokensPerWarp = kBlockN / kWarpsPerBlock;
+
+template <int Warps>
+struct KernelTraits {
+  static_assert(kBlockN % Warps == 0, "kBlockN must be divisible by Warps");
+  static constexpr int kBlockThreads = Warps * kWarpSize;
+  static constexpr int kTokensPerWarp = kBlockN / Warps;
+  static constexpr int kMaxVPerThread =
+      (kMaxVHeadDim + kBlockThreads - 1) / kBlockThreads;
+  static constexpr int kMaxVVecPerThread =
+      ((kMaxVHeadDim / 4) + kBlockThreads - 1) / kBlockThreads;
+};
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
 #if defined(__HIPCC__)
@@ -55,7 +61,7 @@ __device__ __forceinline__ float to_float<half>(half val) {
   return __half2float(val);
 }
 
-template <typename Q, typename Out>
+template <int Warps, typename Q, typename Out>
 __global__ void decode_int8_kv_mla_kernel(
     const Q* __restrict__ q,
     const int8_t* __restrict__ k_cache,
@@ -104,6 +110,11 @@ __global__ void decode_int8_kv_mla_kernel(
     return;
   }
 
+  constexpr int kBlockThreads = KernelTraits<Warps>::kBlockThreads;
+  constexpr int kTokensPerWarp = KernelTraits<Warps>::kTokensPerWarp;
+  constexpr int kMaxVPerThread = KernelTraits<Warps>::kMaxVPerThread;
+  constexpr int kMaxVVecPerThread = KernelTraits<Warps>::kMaxVVecPerThread;
+
   int lane = threadIdx.x % kWarpSize;
   int warp_id = threadIdx.x / kWarpSize;
 
@@ -112,6 +123,10 @@ __global__ void decode_int8_kv_mla_kernel(
   float* qk_tile = q_shared + qk_head_dim;
   float* p_tile = qk_tile + kBlockN;
   float* ml_shared = p_tile + kBlockN;
+  int v_groups = v_head_dim / kv_group_size;
+  float* v_scale_tile = ml_shared + 2;
+  int32_t* idx_tile =
+      reinterpret_cast<int32_t*>(v_scale_tile + kBlockN * v_groups);
   float acc[kMaxVPerThread];
   float acc_vec[kMaxVVecPerThread][4];
 
@@ -127,6 +142,8 @@ __global__ void decode_int8_kv_mla_kernel(
 
   bool vec_k = (kv_group_size % 4 == 0) && (qk_head_dim % 4 == 0);
   bool vec_v = (kv_group_size % 4 == 0) && (v_head_dim % 4 == 0);
+  bool kv_group64 = kv_group_size == 64;
+  bool kv_group128 = kv_group_size == 128;
 
   int v_per_thread = (v_head_dim + blockDim.x - 1) / blockDim.x;
   for (int i = 0; i < v_per_thread; ++i) {
@@ -169,7 +186,14 @@ __global__ void decode_int8_kv_mla_kernel(
         float partial = 0.0f;
         if (vec_k) {
           for (int d = lane * 4; d < qk_head_dim; d += kWarpSize * 4) {
-            int scale_idx = d / kv_group_size;
+            int scale_idx;
+            if (kv_group64) {
+              scale_idx = d >> 6;
+            } else if (kv_group128) {
+              scale_idx = d >> 7;
+            } else {
+              scale_idx = d / kv_group_size;
+            }
             float scale = __half2float(
                 k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
             const int8_t* k_ptr =
@@ -186,7 +210,14 @@ __global__ void decode_int8_kv_mla_kernel(
           }
         } else {
           for (int d = lane; d < qk_head_dim; d += kWarpSize) {
-            int scale_idx = d / kv_group_size;
+            int scale_idx;
+            if (kv_group64) {
+              scale_idx = d >> 6;
+            } else if (kv_group128) {
+              scale_idx = d >> 7;
+            } else {
+              scale_idx = d / kv_group_size;
+            }
             float scale = __half2float(
                 k_scale[token_idx * stride_ks + kv_head * stride_ksh + scale_idx]);
             int8_t k_val =
@@ -202,6 +233,7 @@ __global__ void decode_int8_kv_mla_kernel(
       }
       if (lane == 0) {
         qk_tile[t] = qk;
+        idx_tile[t] = token_valid ? token_idx : -1;
       }
     }
 
@@ -226,6 +258,23 @@ __global__ void decode_int8_kv_mla_kernel(
       l_tile = sum;
       ml_shared[0] = m_tile;
       ml_shared[1] = l_tile;
+    }
+
+    __syncthreads();
+
+    if (vec_v) {
+      int scale_items = tile_count * v_groups;
+      for (int idx = threadIdx.x; idx < scale_items; idx += blockDim.x) {
+        int t = idx / v_groups;
+        int g = idx - t * v_groups;
+        int32_t token_idx = idx_tile[t];
+        float scale = 0.0f;
+        if (token_idx >= 0) {
+          scale = __half2float(
+              v_scale[token_idx * stride_vs + kv_head * stride_vsh + g]);
+        }
+        v_scale_tile[idx] = scale;
+      }
     }
 
     __syncthreads();
@@ -268,9 +317,15 @@ __global__ void decode_int8_kv_mla_kernel(
           for (int vec_idx = threadIdx.x; vec_idx < v_vecs_total;
                vec_idx += blockDim.x, ++acc_idx) {
             int d = vec_idx * 4;
-            int scale_idx = d / kv_group_size;
-            float scale = __half2float(
-                v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
+            int scale_idx;
+            if (kv_group64) {
+              scale_idx = d >> 6;
+            } else if (kv_group128) {
+              scale_idx = d >> 7;
+            } else {
+              scale_idx = d / kv_group_size;
+            }
+            float scale = v_scale_tile[t * v_groups + scale_idx];
             const int8_t* v_ptr =
                 v_cache + token_idx * stride_vbs + kv_head * stride_vh + d;
             int32_t packed = *reinterpret_cast<const int32_t*>(v_ptr);
@@ -287,7 +342,14 @@ __global__ void decode_int8_kv_mla_kernel(
         } else {
           int acc_idx = 0;
           for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x, ++acc_idx) {
-            int scale_idx = d / kv_group_size;
+            int scale_idx;
+            if (kv_group64) {
+              scale_idx = d >> 6;
+            } else if (kv_group128) {
+              scale_idx = d >> 7;
+            } else {
+              scale_idx = d / kv_group_size;
+            }
             float scale = __half2float(
                 v_scale[token_idx * stride_vs + kv_head * stride_vsh + scale_idx]);
             int8_t v_val =
@@ -390,9 +452,19 @@ void decode_attention_int8_kv_mla(
       "v_head_dim exceeds kernel limit");
 
   const dim3 grid(batch_size, head_num, 1);
-  const dim3 block(kBlockThreads, 1, 1);
-  size_t shared_bytes =
-      sizeof(float) * (qk_head_dim + 2 * kBlockN + 2);
+  size_t shared_bytes = sizeof(float) * (qk_head_dim + 2 * kBlockN + 2);
+  shared_bytes += sizeof(float) * (kBlockN * (v_head_dim / kv_group_size));
+  shared_bytes += sizeof(int32_t) * kBlockN;
+
+  static int cached_force_warps = -2;
+  if (cached_force_warps == -2) {
+    const char* env = std::getenv("SGLANG_INT8_KV_MLA_FORCE_WARPS");
+    cached_force_warps = env ? std::atoi(env) : -1;
+  }
+  const bool use_4_warp =
+      (cached_force_warps == 4)
+          ? true
+          : (cached_force_warps == 2) ? false : (v_head_dim >= 512);
 
   const auto stream = at::cuda::getDefaultCUDAStream();
 
@@ -403,209 +475,131 @@ void decode_attention_int8_kv_mla(
   }
 
 #if defined(__HIPCC__)
+#define LAUNCH_MLA_KERNEL(WARPS, QTYPE, OTYPE, QPTR, OPTR) \
+  hipLaunchKernelGGL(                                     \
+      (decode_int8_kv_mla_kernel<WARPS, QTYPE, OTYPE>),    \
+      grid,                                                \
+      dim3(WARPS * kWarpSize, 1, 1),                       \
+      shared_bytes,                                        \
+      stream,                                              \
+      QPTR,                                                \
+      reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()), \
+      reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()), \
+      reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()), \
+      reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()), \
+      reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()), \
+      reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()), \
+      OPTR,                                                \
+      static_cast<int32_t>(batch_size),                    \
+      static_cast<int32_t>(head_num),                      \
+      static_cast<int32_t>(kv_head_num),                   \
+      static_cast<int32_t>(qk_head_dim),                   \
+      static_cast<int32_t>(v_head_dim),                    \
+      static_cast<int32_t>(kv_group_size),                 \
+      static_cast<int32_t>(max_tokens),                    \
+      q.stride(0),                                         \
+      q.stride(1),                                         \
+      k_cache.stride(0),                                   \
+      k_cache.stride(1),                                   \
+      v_cache.stride(0),                                   \
+      v_cache.stride(1),                                   \
+      k_scale.stride(0),                                   \
+      k_scale.stride(1),                                   \
+      v_scale.stride(0),                                   \
+      v_scale.stride(1),                                   \
+      output.stride(0),                                    \
+      output.stride(1),                                    \
+      static_cast<float>(sm_scale),                        \
+      static_cast<float>(logit_cap))
+
   if (out_is_fp16 && q_is_fp16) {
-    hipLaunchKernelGGL(
-        (decode_int8_kv_mla_kernel<half, half>),
-        grid,
-        block,
-        shared_bytes,
-        stream,
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        static_cast<int32_t>(batch_size),
-        static_cast<int32_t>(head_num),
-        static_cast<int32_t>(kv_head_num),
-        static_cast<int32_t>(qk_head_dim),
-        static_cast<int32_t>(v_head_dim),
-        static_cast<int32_t>(kv_group_size),
-        static_cast<int32_t>(max_tokens),
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        v_scale.stride(0),
-        v_scale.stride(1),
-        output.stride(0),
-        output.stride(1),
-        static_cast<float>(sm_scale),
-        static_cast<float>(logit_cap));
+    auto q_ptr = reinterpret_cast<half*>(q.data_ptr<at::Half>());
+    auto o_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+    if (use_4_warp) {
+      LAUNCH_MLA_KERNEL(4, half, half, q_ptr, o_ptr);
+    } else {
+      LAUNCH_MLA_KERNEL(2, half, half, q_ptr, o_ptr);
+    }
   } else if (out_is_fp16 && !q_is_fp16) {
-    hipLaunchKernelGGL(
-        (decode_int8_kv_mla_kernel<float, half>),
-        grid,
-        block,
-        shared_bytes,
-        stream,
-        reinterpret_cast<float*>(q.data_ptr<float>()),
-        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        static_cast<int32_t>(batch_size),
-        static_cast<int32_t>(head_num),
-        static_cast<int32_t>(kv_head_num),
-        static_cast<int32_t>(qk_head_dim),
-        static_cast<int32_t>(v_head_dim),
-        static_cast<int32_t>(kv_group_size),
-        static_cast<int32_t>(max_tokens),
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        v_scale.stride(0),
-        v_scale.stride(1),
-        output.stride(0),
-        output.stride(1),
-        static_cast<float>(sm_scale),
-        static_cast<float>(logit_cap));
+    auto q_ptr = reinterpret_cast<float*>(q.data_ptr<float>());
+    auto o_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+    if (use_4_warp) {
+      LAUNCH_MLA_KERNEL(4, float, half, q_ptr, o_ptr);
+    } else {
+      LAUNCH_MLA_KERNEL(2, float, half, q_ptr, o_ptr);
+    }
   } else {
-    hipLaunchKernelGGL(
-        (decode_int8_kv_mla_kernel<float, float>),
-        grid,
-        block,
-        shared_bytes,
-        stream,
-        reinterpret_cast<float*>(q.data_ptr<float>()),
-        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-        reinterpret_cast<float*>(output.data_ptr<float>()),
-        static_cast<int32_t>(batch_size),
-        static_cast<int32_t>(head_num),
-        static_cast<int32_t>(kv_head_num),
-        static_cast<int32_t>(qk_head_dim),
-        static_cast<int32_t>(v_head_dim),
-        static_cast<int32_t>(kv_group_size),
-        static_cast<int32_t>(max_tokens),
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        v_scale.stride(0),
-        v_scale.stride(1),
-        output.stride(0),
-        output.stride(1),
-        static_cast<float>(sm_scale),
-        static_cast<float>(logit_cap));
+    auto q_ptr = reinterpret_cast<float*>(q.data_ptr<float>());
+    auto o_ptr = reinterpret_cast<float*>(output.data_ptr<float>());
+    if (use_4_warp) {
+      LAUNCH_MLA_KERNEL(4, float, float, q_ptr, o_ptr);
+    } else {
+      LAUNCH_MLA_KERNEL(2, float, float, q_ptr, o_ptr);
+    }
   }
+#undef LAUNCH_MLA_KERNEL
 #else
+#define LAUNCH_MLA_KERNEL(WARPS, QTYPE, OTYPE, QPTR, OPTR) \
+  decode_int8_kv_mla_kernel<WARPS, QTYPE, OTYPE><<<         \
+      grid,                                                \
+      dim3(WARPS * kWarpSize, 1, 1),                       \
+      shared_bytes,                                        \
+      stream>>>(                                           \
+      QPTR,                                                \
+      reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()), \
+      reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()), \
+      reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()), \
+      reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()), \
+      reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()), \
+      reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()), \
+      OPTR,                                                \
+      static_cast<int32_t>(batch_size),                    \
+      static_cast<int32_t>(head_num),                      \
+      static_cast<int32_t>(kv_head_num),                   \
+      static_cast<int32_t>(qk_head_dim),                   \
+      static_cast<int32_t>(v_head_dim),                    \
+      static_cast<int32_t>(kv_group_size),                 \
+      static_cast<int32_t>(max_tokens),                    \
+      q.stride(0),                                         \
+      q.stride(1),                                         \
+      k_cache.stride(0),                                   \
+      k_cache.stride(1),                                   \
+      v_cache.stride(0),                                   \
+      v_cache.stride(1),                                   \
+      k_scale.stride(0),                                   \
+      k_scale.stride(1),                                   \
+      v_scale.stride(0),                                   \
+      v_scale.stride(1),                                   \
+      output.stride(0),                                    \
+      output.stride(1),                                    \
+      static_cast<float>(sm_scale),                        \
+      static_cast<float>(logit_cap))
+
   if (out_is_fp16 && q_is_fp16) {
-    decode_int8_kv_mla_kernel<half, half><<<grid, block, shared_bytes, stream>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        static_cast<int32_t>(batch_size),
-        static_cast<int32_t>(head_num),
-        static_cast<int32_t>(kv_head_num),
-        static_cast<int32_t>(qk_head_dim),
-        static_cast<int32_t>(v_head_dim),
-        static_cast<int32_t>(kv_group_size),
-        static_cast<int32_t>(max_tokens),
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        v_scale.stride(0),
-        v_scale.stride(1),
-        output.stride(0),
-        output.stride(1),
-        static_cast<float>(sm_scale),
-        static_cast<float>(logit_cap));
+    auto q_ptr = reinterpret_cast<half*>(q.data_ptr<at::Half>());
+    auto o_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+    if (use_4_warp) {
+      LAUNCH_MLA_KERNEL(4, half, half, q_ptr, o_ptr);
+    } else {
+      LAUNCH_MLA_KERNEL(2, half, half, q_ptr, o_ptr);
+    }
   } else if (out_is_fp16 && !q_is_fp16) {
-    decode_int8_kv_mla_kernel<float, half><<<grid, block, shared_bytes, stream>>>(
-        reinterpret_cast<float*>(q.data_ptr<float>()),
-        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        static_cast<int32_t>(batch_size),
-        static_cast<int32_t>(head_num),
-        static_cast<int32_t>(kv_head_num),
-        static_cast<int32_t>(qk_head_dim),
-        static_cast<int32_t>(v_head_dim),
-        static_cast<int32_t>(kv_group_size),
-        static_cast<int32_t>(max_tokens),
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        v_scale.stride(0),
-        v_scale.stride(1),
-        output.stride(0),
-        output.stride(1),
-        static_cast<float>(sm_scale),
-        static_cast<float>(logit_cap));
+    auto q_ptr = reinterpret_cast<float*>(q.data_ptr<float>());
+    auto o_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+    if (use_4_warp) {
+      LAUNCH_MLA_KERNEL(4, float, half, q_ptr, o_ptr);
+    } else {
+      LAUNCH_MLA_KERNEL(2, float, half, q_ptr, o_ptr);
+    }
   } else {
-    decode_int8_kv_mla_kernel<float, float><<<grid, block, shared_bytes, stream>>>(
-        reinterpret_cast<float*>(q.data_ptr<float>()),
-        reinterpret_cast<int8_t*>(k_cache.data_ptr<int8_t>()),
-        reinterpret_cast<int8_t*>(v_cache.data_ptr<int8_t>()),
-        reinterpret_cast<half*>(k_scale.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v_scale.data_ptr<at::Half>()),
-        reinterpret_cast<int32_t*>(kv_indptr.data_ptr<int32_t>()),
-        reinterpret_cast<int32_t*>(kv_indices.data_ptr<int32_t>()),
-        reinterpret_cast<float*>(output.data_ptr<float>()),
-        static_cast<int32_t>(batch_size),
-        static_cast<int32_t>(head_num),
-        static_cast<int32_t>(kv_head_num),
-        static_cast<int32_t>(qk_head_dim),
-        static_cast<int32_t>(v_head_dim),
-        static_cast<int32_t>(kv_group_size),
-        static_cast<int32_t>(max_tokens),
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        v_scale.stride(0),
-        v_scale.stride(1),
-        output.stride(0),
-        output.stride(1),
-        static_cast<float>(sm_scale),
-        static_cast<float>(logit_cap));
+    auto q_ptr = reinterpret_cast<float*>(q.data_ptr<float>());
+    auto o_ptr = reinterpret_cast<float*>(output.data_ptr<float>());
+    if (use_4_warp) {
+      LAUNCH_MLA_KERNEL(4, float, float, q_ptr, o_ptr);
+    } else {
+      LAUNCH_MLA_KERNEL(2, float, float, q_ptr, o_ptr);
+    }
   }
+#undef LAUNCH_MLA_KERNEL
 #endif
 }
