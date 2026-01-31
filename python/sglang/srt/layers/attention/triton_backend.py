@@ -1146,12 +1146,11 @@ class TritonAttnBackend(AttentionBackend):
             self._int8_kv_hip_debugged = True
         if not self._use_int8_kv_hip:
             return False
-        # Custom HIP int8 decode kernel only supports standard MHA KV layout.
-        # MLA-style KV caches share a single buffer and are not compatible.
+        use_mla_kernel = False
         try:
             kv_pool = forward_batch.token_to_kv_pool
             if getattr(kv_pool, "kv_lora_rank", None):
-                return False
+                use_mla_kernel = True
             k_buf = kv_pool.get_key_buffer(layer.layer_id)
             v_buf = kv_pool.get_value_buffer(layer.layer_id)
             if (
@@ -1160,9 +1159,9 @@ class TritonAttnBackend(AttentionBackend):
                 and k_buf.untyped_storage().data_ptr()
                 == v_buf.untyped_storage().data_ptr()
             ):
-                return False
+                use_mla_kernel = True
         except Exception:
-            pass
+            use_mla_kernel = False
         if k_scale is None or v_scale is None:
             return False
         if layer.qk_head_dim % kv_group_size != 0 or layer.v_head_dim % kv_group_size != 0:
@@ -1205,19 +1204,34 @@ class TritonAttnBackend(AttentionBackend):
                     tuple(kv_indices_i32.shape),
                     kv_group_size,
                 )
-            torch.ops.sgl_kernel.decode_attention_int8_kv(
-                q_kernel.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                k_scale,
-                v_scale,
-                kv_indptr_i32,
-                kv_indices_i32,
-                o_kernel.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                layer.scaling,
-                logit_cap,
-                kv_group_size,
-            )
+            if use_mla_kernel:
+                torch.ops.sgl_kernel.decode_attention_int8_kv_mla(
+                    q_kernel.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    k_scale,
+                    v_scale,
+                    kv_indptr_i32,
+                    kv_indices_i32,
+                    o_kernel.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    layer.scaling,
+                    logit_cap,
+                    kv_group_size,
+                )
+            else:
+                torch.ops.sgl_kernel.decode_attention_int8_kv(
+                    q_kernel.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    k_scale,
+                    v_scale,
+                    kv_indptr_i32,
+                    kv_indices_i32,
+                    o_kernel.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    layer.scaling,
+                    logit_cap,
+                    kv_group_size,
+                )
             if debug:
                 can_sync = True
                 if hasattr(torch.cuda, "is_current_stream_capturing"):

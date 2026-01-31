@@ -715,6 +715,18 @@ void decode_attention_int8_kv(
     double sm_scale,
     double logit_cap,
     int64_t kv_group_size);
+void decode_attention_int8_kv_mla(
+    at::Tensor q,
+    at::Tensor k_cache,
+    at::Tensor v_cache,
+    at::Tensor k_scale,
+    at::Tensor v_scale,
+    at::Tensor kv_indptr,
+    at::Tensor kv_indices,
+    at::Tensor output,
+    double sm_scale,
+    double logit_cap,
+    int64_t kv_group_size);
 
 /*
  * From FlashInfer

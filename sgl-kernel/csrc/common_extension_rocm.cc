@@ -233,6 +233,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "decode_attention_int8_kv(Tensor q, Tensor k_cache, Tensor v_cache, Tensor k_scale, Tensor v_scale, "
       "Tensor kv_indptr, Tensor kv_indices, Tensor! output, float sm_scale, float logit_cap, int kv_group_size) -> ()");
   m.impl("decode_attention_int8_kv", torch::kCUDA, &decode_attention_int8_kv);
+  m.def(
+      "decode_attention_int8_kv_mla(Tensor q, Tensor k_cache, Tensor v_cache, Tensor k_scale, Tensor v_scale, "
+      "Tensor kv_indptr, Tensor kv_indices, Tensor! output, float sm_scale, float logit_cap, int kv_group_size) -> ()");
+  m.impl("decode_attention_int8_kv_mla", torch::kCUDA, &decode_attention_int8_kv_mla);
 }
 
 REGISTER_EXTENSION(common_ops)

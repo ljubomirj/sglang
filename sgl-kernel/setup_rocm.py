@@ -56,6 +56,7 @@ sources = [
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
     "csrc/attention/int8_kv_decode.cu",
+    "csrc/attention/int8_kv_decode_mla.cu",
 ]
 
 cxx_flags = ["-O3"]
