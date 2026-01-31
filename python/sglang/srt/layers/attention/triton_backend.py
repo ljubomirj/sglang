@@ -1146,6 +1146,23 @@ class TritonAttnBackend(AttentionBackend):
             self._int8_kv_hip_debugged = True
         if not self._use_int8_kv_hip:
             return False
+        # Custom HIP int8 decode kernel only supports standard MHA KV layout.
+        # MLA-style KV caches share a single buffer and are not compatible.
+        try:
+            kv_pool = forward_batch.token_to_kv_pool
+            if getattr(kv_pool, "kv_lora_rank", None):
+                return False
+            k_buf = kv_pool.get_key_buffer(layer.layer_id)
+            v_buf = kv_pool.get_value_buffer(layer.layer_id)
+            if (
+                k_buf is not None
+                and v_buf is not None
+                and k_buf.untyped_storage().data_ptr()
+                == v_buf.untyped_storage().data_ptr()
+            ):
+                return False
+        except Exception:
+            pass
         if k_scale is None or v_scale is None:
             return False
         if layer.qk_head_dim % kv_group_size != 0 or layer.v_head_dim % kv_group_size != 0:
@@ -1264,8 +1281,13 @@ class TritonAttnBackend(AttentionBackend):
                         if get_bool_env_var(
                             "SGLANG_INT8_KV_VALIDATE_DISABLE_ON_FAIL", "true"
                         ):
+                            # Ensure current output is correct before disabling the kernel.
+                            try:
+                                o_kernel.copy_(o_ref)
+                            except Exception:
+                                pass
                             self._use_int8_kv_hip = False
-                            return False
+                            return True
                     if not validate_always:
                         self._int8_kv_hip_validated = True
             if not self._int8_kv_hip_logged:
